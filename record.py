@@ -8,11 +8,16 @@ import os
 # 设置 HuggingFace 镜像（解决国内连接问题）
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
+# 加载 .env 文件中的环境变量
+from dotenv import load_dotenv
+load_dotenv()
+
 import io
 import json
 import base64
 import numpy as np
 from PIL import Image
+from typing import Literal
 from transformers import CLIPProcessor, CLIPModel
 from google import genai
 from google.genai import types
@@ -99,28 +104,74 @@ def open_from_path(path: str = None) -> Image.Image:
     return Image.open(path).convert("RGB")
 
 
-# ========== VLM分析函数 ==========
+# ========== 触发类型定义 ==========
 
-def vlm_chat_mock(image_bytes: str, context: str) -> str:
-    """使用VLM分析物理世界的图像和用户意图，返回JSON格式的分析结果"""
+PhysicalTriggerType = Literal[
+    "眼动焦点注视单一物体超过五秒钟",
+    "手部坐标与物体坐标重叠",
+    "语音输入触发",
+    "其他"
+]
+
+# TODO: 虚拟世界触发类型待定
+# VirtualTriggerType = Literal[
+#     "待定触发类型1",
+#     "待定触发类型2",
+# ]
+
+
+# ========== 物理世界Prompt构建 ==========
+
+def get_physical_analysis_prompt(trigger_type: PhysicalTriggerType, transcript_text: str) -> str:
+    """
+    构建物理世界分析的Prompt，整合触发类型和语音文本。
+
+    Args:
+        trigger_type: 物理世界触发类型（眼动注视/手部交互/语音触发）
+        transcript_text: 语音转文本结果（如无语音则为空字符串）
+
+    Returns:
+        VLM分析用的Prompt字符串
+    """
     prompt = f'''
-You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in physical space, specializing in visual analysis. Your task is to analyze the provided images, user voice, and behavior, and then determine the user's current behavioral intention.
-Based on your analysis, you must generate a JSON object with the following three keys. Your entire response must be ONLY the JSON object, with no introductory text or explanations.
+You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in physical space, specializing in visual analysis. Your task is to analyze the provided images, trigger context, and user voice, then determine the user's current behavioral intention.
+
+Based on your analysis, you must generate a JSON object with the following keys. Your entire response must be ONLY the JSON object, with no introductory text or explanations.
+
+### [Input Context]
+- Trigger Type: {trigger_type}
+- User Voice (Transcript): {transcript_text}
 
 ### [JSON Keys]
 1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
 2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
-3. "User Speaking": Transcribe the user's exact words. If silent, return "".
-4. "Behavior description": A single, concise sentence describing the user's interaction (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
+3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
+4. "Behavior description": A single, concise sentence describing the user's interaction based on the trigger type and visual analysis (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
 5. "User intent": Classify the intent into EXACTLY one of the following strings:
     - "Appearance design": Related to visual form, proportions, materials, or surface details.
     - "Functional concept": Related to functional objectives or improving features.
     - "Structural design": Related to component relationships, layout, or adjustments.
     - "Still-uncertain Idea Exploration": Exploratory attempts or undecided design thoughts.
     - "Design Background supplement": Information related to goals, target users, or scenarios.
-[User's Statement / Context]
-{context}
 '''
+    return prompt
+
+
+# ========== VLM分析函数 ==========
+
+def vlm_chat_mock(image_bytes: str, trigger_type: PhysicalTriggerType, transcript_text: str) -> str:
+    """
+    使用VLM分析物理世界的图像、触发类型和语音文本，返回JSON格式的分析结果。
+
+    Args:
+        image_bytes: Base64编码的图像
+        trigger_type: 物理世界触发类型
+        transcript_text: 语音转文本结果
+
+    Returns:
+        JSON字符串，包含 type, label, User Speaking, Behavior description, User intent
+    """
+    prompt = get_physical_analysis_prompt(trigger_type, transcript_text)
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=[
@@ -134,27 +185,42 @@ Based on your analysis, you must generate a JSON object with the following three
     return response.text
 
 
-def vlm_chat_virtual(virtual_json: dict, context: str) -> str:
-    """使用VLM分析虚拟世界的JSON数据和用户意图，返回JSON格式的分析结果"""
+def vlm_chat_virtual(virtual_json: dict, trigger_type: str, transcript_text: str) -> str:
+    """
+    使用VLM分析虚拟世界的操作数据、触发类型和语音文本，返回JSON格式的分析结果。
+
+    TODO: 虚拟世界触发类型和virtual_json格式待定，需要用户确认后完善此函数。
+
+    Args:
+        virtual_json: 虚拟界面操作数据（格式待定）
+        trigger_type: 虚拟世界触发类型（待定）
+        transcript_text: 语音转文本结果
+
+    Returns:
+        JSON字符串，包含 type, label, User Speaking, Behavior description, User intent
+    """
+    # TODO: 待用户确定虚拟世界触发类型和virtual_json格式后，完善prompt构建逻辑
     prompt = f'''
-You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in virtual space, specializing in operation analysis. Your task is to analyze the provided virtual operation data, user voice, and behavior, and then determine the user's current behavioral intention.
-Based on your analysis, you must generate a JSON object with the following three keys. Your entire response must be ONLY the JSON object, with no introductory text or explanations.
+You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in virtual space, specializing in operation analysis. Your task is to analyze the provided virtual operation data, user voice, and behavior, then determine the user's current behavioral intention.
+
+Based on your analysis, you must generate a JSON object with the following keys. Your entire response must be ONLY the JSON object, with no introductory text or explanations.
+
+### [Input Context]
+- Trigger Type: {trigger_type} (TODO: 虚拟世界触发类型待定)
+- User Voice (Transcript): {transcript_text}
+- Virtual Operation Data: {json.dumps(virtual_json, indent=2, ensure_ascii=False)}
 
 ### [JSON Keys]
 1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
 2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
-3. "User Speaking": Transcribe the user's exact words. If silent, return "".
-4. "Behavior description": A single, concise sentence describing the user's interaction (e.g., "The designer is modifying the handle geometry in the CAD software").
+3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
+4. "Behavior description": A single, concise sentence describing the user's interaction in the virtual environment (e.g., "The designer is modifying the handle geometry in the CAD software").
 5. "User intent": Classify the intent into EXACTLY one of the following strings:
     - "Appearance design": Related to visual form, proportions, materials, or surface details.
     - "Functional concept": Related to functional objectives or improving features.
     - "Structural design": Related to component relationships, layout, or adjustments.
     - "Still-uncertain Idea Exploration": Exploratory attempts or undecided design thoughts.
     - "Design Background supplement": Information related to goals, target users, or scenarios.
-[Virtual Operation Data]
-{json.dumps(virtual_json, indent=2, ensure_ascii=False)}
-[User's Statement / Context]
-{context}
 '''
     response = client.models.generate_content(
         model='gemini-2.5-flash',

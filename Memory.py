@@ -19,7 +19,8 @@ from record import (
     load_memory_from_json, save_memory_to_json,
     extract_and_parse_json,
     llm_merge_names, llm_merge_descriptions,
-    llm_analyze_design_info
+    llm_analyze_design_info,
+    PhysicalTriggerType
 )
 
 
@@ -190,12 +191,26 @@ def find_or_update_description(
 def find_or_create_obj(
     frame: Image.Image,
     bbox: BoundingBox,
-    context: str,
+    trigger_type: PhysicalTriggerType,
+    transcript_text: str,
     memory_db: Dict[str, Any],
     similarity_threshold: float = 0.90
 ) -> ObjectNode:
-    """查找或创建物体节点"""
-    print(f"\n--- Processing: '{context}' ---")
+    """
+    查找或创建物体节点。
+
+    Args:
+        frame: 视频帧图像
+        bbox: 关注区域的边界框（来自眼动追踪或手部检测）
+        trigger_type: 物理世界触发类型（眼动注视/手部交互/语音触发）
+        transcript_text: 语音转文本结果
+        memory_db: 记忆数据库
+        similarity_threshold: 相似度阈值
+
+    Returns:
+        ObjectNode: 找到或创建的物体节点
+    """
+    print(f"\n--- Processing: trigger='{trigger_type}', transcript='{transcript_text}' ---")
 
     crop = get_crop(frame, bbox)
     new_embedding = image_encoder(crop)
@@ -227,7 +242,7 @@ def find_or_create_obj(
                 return node
 
     print("NO MATCH. Creating new object.")
-    ret_json = extract_and_parse_json(vlm_chat_mock(encode_image_to_base64(frame), context))
+    ret_json = extract_and_parse_json(vlm_chat_mock(encode_image_to_base64(frame), trigger_type, transcript_text))
 
     if ret_json is None:
         print("[Warning] VLM returned invalid JSON")
@@ -707,48 +722,58 @@ if __name__ == "__main__":
 
     memory_database = load_memory_from_json(JSON_MEMORY_FILE)
 
+    # ========== Step 1: 处理 generated_images 文件夹中的图片 ==========
+    print("\n--- Step 1: Processing generated_images folder ---")
+    memory_database = batch_update_images(memory_database)
+    save_memory_to_json(memory_database, JSON_MEMORY_FILE)
+
+    # ========== Step 2: VLM分析（可选，需要test.png）==========
     try:
         source_frame = Image.open(IMAGE_FILE_PATH).convert("RGB")
     except FileNotFoundError:
-        print(f"错误：找不到文件 '{IMAGE_FILE_PATH}'")
-        exit()
+        print(f"[Skip VLM] 找不到文件 '{IMAGE_FILE_PATH}'，跳过VLM分析")
+        source_frame = None
 
-    context = "这是一个手柄的设计，采用人体工程学设计，方便抓握"
+    if source_frame:
+        # 演示：模拟触发类型和语音文本（实际应由外部模块传入）
+        trigger_type = "眼动焦点注视单一物体超过五秒钟"
+        transcript_text = "我正在设计社区配送机器人的履带，我希望它能平稳的在社区间行走，履带整体是充满链条的，有科技感的外形，能适应不同的地面环境。"
 
-    print("\n--- Analyzing image ---")
-    image_bytes = encode_image_to_base64(source_frame)
-    vlm_response = vlm_chat_mock(image_bytes, context)
-    print(f"[VLM] {vlm_response[:200]}...")
+        print("\n--- Step 2: Analyzing image with VLM ---")
+        image_bytes = encode_image_to_base64(source_frame)
+        vlm_response = vlm_chat_mock(image_bytes, trigger_type, transcript_text)
+        print(f"[VLM] {vlm_response[:200]}...")
 
-    vlm_result = extract_and_parse_json(vlm_response)
+        vlm_result = extract_and_parse_json(vlm_response)
 
-    if vlm_result:
-        print(f"[Parsed] Type: {vlm_result.get('type')}")
+        if vlm_result:
+            print(f"[Parsed] Type: {vlm_result.get('type')}")
 
-        node, node_type = process_vlm_result(
-            vlm_result=vlm_result,
-            memory_db=memory_database,
-            component_image=source_frame
-        )
+            node, node_type = process_vlm_result(
+                vlm_result=vlm_result,
+                memory_db=memory_database,
+                component_image=source_frame
+            )
 
-        if node:
-            memory_database[node.node_id] = node.model_dump()
-            save_memory_to_json(memory_database, JSON_MEMORY_FILE)
+            if node:
+                memory_database[node.node_id] = node.model_dump()
+                save_memory_to_json(memory_database, JSON_MEMORY_FILE)
 
-            print(f"\n--- {node_type} node ---")
-            print(f"ID: {node.node_id}")
-            if node_type == "component":
-                print(f"Name: {node.component_name}")
-                print(f"Appearance: {len(node.appearance_descriptions)}")
-                print(f"Structure: {len(node.structure_descriptions)}")
-                print(f"Function: {len(node.function_descriptions)}")
-            elif node_type == "overall":
-                print(f"Background: {node.design_background}")
-                print(f"Appearances: {len(node.overall_appearances)}")
-                print(f"Functions: {len(node.overall_functions)}")
-    else:
-        print("[Error] Failed to parse VLM response")
+                print(f"\n--- {node_type} node ---")
+                print(f"ID: {node.node_id}")
+                if node_type == "component":
+                    print(f"Name: {node.component_name}")
+                    print(f"Appearance: {len(node.appearance_descriptions)}")
+                    print(f"Structure: {len(node.structure_descriptions)}")
+                    print(f"Function: {len(node.function_descriptions)}")
+                elif node_type == "overall":
+                    print(f"Background: {node.design_background}")
+                    print(f"Appearances: {len(node.overall_appearances)}")
+                    print(f"Functions: {len(node.overall_functions)}")
+        else:
+            print("[Error] Failed to parse VLM response")
 
+    # ========== Summary ==========
     print("\n--- Summary ---")
     component_count = sum(1 for d in memory_database.values() if d.get('node_type') == 'COMPONENT')
     overall_count = sum(1 for d in memory_database.values() if d.get('node_type') == 'OVERALL')
