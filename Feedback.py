@@ -8,7 +8,7 @@ import numpy as np
 from typing import Dict, Any, Tuple, Optional
 
 # 从 record.py 导入需要的函数
-from record import text_encoder, extract_and_parse_json
+from record import text_encoder, extract_and_parse_json, client
 
 
 # ========== 重复检测配置 ==========
@@ -204,21 +204,125 @@ def reset_repeat_count(component_name: str = None):
         print(f"[Feedback] '{component_name}' count reset")
 
 
-# ========== AI 反馈生成函数（待实现）==========
+# ========== AI 反馈生成函数 ==========
 
-def generate_ai_feedback(component_name: str, vlm_output: dict) -> str:
+def get_component_memory(component_name: str, memory_db: dict = None) -> dict:
     """
-    生成 AI 主动反馈内容。
-
-    TODO: 根据部件名和 VLM 输出生成针对性的反馈
+    从记忆数据库中获取指定部件的记忆信息。
 
     Args:
         component_name: 部件名称
-        vlm_output: VLM 分析结果
+        memory_db: 记忆数据库（为 None 则从文件加载）
+
+    Returns:
+        部件记忆信息 dict，包含 appearance, function, structure 描述
+    """
+    import os
+
+    # 如果没有传入 memory_db，从文件加载
+    if memory_db is None:
+        memory_path = os.path.join(os.path.dirname(__file__), "object_nodes.json")
+        if os.path.exists(memory_path):
+            with open(memory_path, 'r', encoding='utf-8') as f:
+                memory_db = json.load(f)
+        else:
+            return {}
+
+    # 查找匹配的部件节点
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            stored_name = data.get('component_name', '')
+            # 名字匹配（忽略大小写）
+            if stored_name.lower() == component_name.lower():
+                return {
+                    "component_name": stored_name,
+                    "appearance": [d.get("content", "") for d in data.get("appearance_descriptions", [])],
+                    "function": [d.get("content", "") for d in data.get("function_descriptions", [])],
+                    "structure": [d.get("content", "") for d in data.get("structure_descriptions", [])],
+                    "design_background": data.get("design_background")
+                }
+
+    # 没找到，返回空
+    return {"component_name": component_name, "appearance": [], "function": [], "structure": []}
+
+
+def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict = None) -> str:
+    """
+    生成 AI 主动反馈内容。
+
+    根据部件记忆和当前 VLM 输出，针对用户意图生成建议。
+
+    Args:
+        component_name: 部件名称
+        vlm_output: VLM 分析结果（包含 User intent, Behavior description 等）
+        memory_db: 记忆数据库（为 None 则从文件加载）
 
     Returns:
         AI 反馈文本
     """
-    # TODO: 实现反馈生成逻辑
-    feedback = f"[AI Feedback] 我注意到你一直在关注 '{component_name}'，需要我提供一些建议吗？"
-    return feedback
+    from record import client
+
+    # 1. 获取部件记忆
+    component_memory = get_component_memory(component_name, memory_db)
+
+    # 2. 提取当前信息
+    user_intent = vlm_output.get("User intent", "")
+    behavior_description = vlm_output.get("Behavior description", "")
+    user_speaking = vlm_output.get("User Speaking", "")
+
+    # 3. 根据 User intent 构建不同的提示
+    intent_prompts = {
+        "Appearance design": "用户正在关注产品的外观设计，包括外形、尺寸、材质、颜色、表面纹理等。请基于已有记忆提供外观设计相关的建议。",
+        "Functional concept": "用户正在思考产品的功能目标和使用方式。请基于已有记忆提供功能设计相关的建议。",
+        "Structural design": "用户正在考虑产品的结构关系、部件连接、布局等。请基于已有记忆提供结构设计相关的建议。",
+        "Still-uncertain Idea Exploration": "用户正在进行探索性思考，想法还不够确定。请帮助用户梳理思路，提供引导性问题或建议。",
+        "Design Background supplement": "用户正在补充设计背景信息，如目标用户、使用场景等。请帮助用户完善背景信息。"
+    }
+
+    intent_context = intent_prompts.get(user_intent, "用户正在思考设计相关的问题。")
+
+    # 4. 构建 prompt
+    prompt = f'''
+你是一个专业的设计助手，正在协助用户进行产品设计。用户已经连续多次关注同一个部件，你需要主动提供有价值的建议。
+
+## 当前关注部件
+部件名称：{component_name}
+
+## 部件已有记忆
+- 外形描述：{component_memory.get("appearance", [])}
+- 功能描述：{component_memory.get("function", [])}
+- 结构描述：{component_memory.get("structure", [])}
+
+## 用户当前状态
+- 用户意图类型：{user_intent}
+- 行为描述：{behavior_description}
+- 用户说的话：{user_speaking if user_speaking else "（用户没有说话）"}
+
+## 你的任务
+{intent_context}
+
+## 输出要求
+1. 简洁友好，不超过100字
+2. 基于已有记忆直接给出具体建议，不要泛泛而谈
+3. 如果记忆信息不足，提出具体的设计问题引导用户思考
+4. 用中文回复
+5. 直接输出建议，不要有任何前缀、问候语或"我建议"等开场白
+
+请直接输出建议内容：
+'''
+
+    # 5. 调用 LLM 生成反馈
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[prompt]
+        )
+        feedback = response.text.strip()
+        print(f"[AI Feedback] Generated for '{component_name}': {feedback[:50]}...")
+        return feedback
+    except Exception as e:
+        print(f"[AI Feedback] Error generating feedback: {e}")
+        # 异常时也直接给建议，不询问
+        if component_memory.get("appearance") or component_memory.get("function"):
+            return f"基于已记录的{component_name}设计信息，建议进一步明确细节需求。"
+        return f"关于{component_name}的设计，可以从外形、功能或结构方面进一步深化。"
