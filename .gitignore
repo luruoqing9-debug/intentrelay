@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Cache
+cache/
+
+# 环境变量/配置
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 图片文件夹（生成的图片不提交）
+generated_images/
+processed_images/
+
+# 记忆数据库（运行时生成）
+object_nodes.json
+
+# 测试图片
+test.png
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
