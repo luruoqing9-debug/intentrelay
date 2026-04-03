@@ -3,6 +3,15 @@ Feedback.py - AI反馈模块
 包含：重复检测、反馈触发逻辑
 """
 
+import sys
+import os
+
+# 设置 Windows 控制台编码为 UTF-8
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import json
 import numpy as np
 from typing import Dict, Any, Tuple, Optional
@@ -246,11 +255,21 @@ def get_component_memory(component_name: str, memory_db: dict = None) -> dict:
     return {"component_name": component_name, "appearance": [], "function": [], "structure": []}
 
 
-def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict = None) -> str:
-    """
-    生成 AI 主动反馈内容。
+# ========== 评分权重配置 ==========
 
-    根据部件记忆和当前 VLM 输出，针对用户意图生成建议。
+EVALUATION_WEIGHTS = {
+    "Novelty": 1.0,
+    "Value": 1.0,
+    "Feasibility": 1.0,
+    "Context-specific": 1.0
+}
+
+
+def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict = None) -> dict:
+    """
+    生成 AI 主动反馈内容（3个建议 + 评分）。
+
+    根据部件记忆和当前 VLM 输出，针对用户意图生成3个建议并评分。
 
     Args:
         component_name: 部件名称
@@ -258,7 +277,16 @@ def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict 
         memory_db: 记忆数据库（为 None 则从文件加载）
 
     Returns:
-        AI 反馈文本
+        dict: {
+            "suggestions": [
+                {
+                    "content": "建议内容",
+                    "scores": {"Novelty": 85, "Value": 90, "Feasibility": 75, "Context-specific": 88},
+                    "total_score": 84.5
+                },
+                ...
+            ]
+        }
     """
     from record import client
 
@@ -272,17 +300,17 @@ def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict 
 
     # 3. 根据 User intent 构建不同的提示
     intent_prompts = {
-        "Appearance design": "用户正在关注产品的外观设计，包括外形、尺寸、材质、颜色、表面纹理等。请基于已有记忆提供外观设计相关的建议。",
-        "Functional concept": "用户正在思考产品的功能目标和使用方式。请基于已有记忆提供功能设计相关的建议。",
-        "Structural design": "用户正在考虑产品的结构关系、部件连接、布局等。请基于已有记忆提供结构设计相关的建议。",
-        "Still-uncertain Idea Exploration": "用户正在进行探索性思考，想法还不够确定。请帮助用户梳理思路，提供引导性问题或建议。",
-        "Design Background supplement": "用户正在补充设计背景信息，如目标用户、使用场景等。请帮助用户完善背景信息。"
+        "Appearance design": "用户正在关注产品的外观设计，包括外形、尺寸、材质、颜色、表面纹理等。",
+        "Functional concept": "用户正在思考产品的功能目标和使用方式。",
+        "Structural design": "用户正在考虑产品的结构关系、部件连接、布局等。",
+        "Still-uncertain Idea Exploration": "用户正在进行探索性思考，想法还不够确定。",
+        "Design Background supplement": "用户正在补充设计背景信息，如目标用户、使用场景等。"
     }
 
     intent_context = intent_prompts.get(user_intent, "用户正在思考设计相关的问题。")
 
-    # 4. 构建 prompt
-    prompt = f'''
+    # 4. 构建生成建议的 prompt
+    generate_prompt = f'''
 你是一个专业的设计助手，正在协助用户进行产品设计。用户已经连续多次关注同一个部件，你需要主动提供有价值的建议。
 
 ## 当前关注部件
@@ -302,26 +330,293 @@ def generate_ai_feedback(component_name: str, vlm_output: dict, memory_db: dict 
 {intent_context}
 
 ## 输出要求
-1. 简洁友好，不超过100字
-2. 基于已有记忆直接给出具体建议
-3. 用中文回复
-4. 直接输出建议，不要有任何前缀、问候语或"我建议"等开场白
+请生成3个内容侧重不同的设计建议，每个建议不超过80字。
+直接输出建议，不要有任何前缀、问候语或"我建议"等开场白。
 
-请直接输出建议内容：
+输出格式（严格遵守JSON格式）：
+{{
+    "suggestions": [
+        "建议1内容",
+        "建议2内容",
+        "建议3内容"
+    ]
+}}
 '''
 
-    # 5. 调用 LLM 生成反馈
+    # 5. 调用 LLM 生成3个建议
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=[prompt]
+            contents=[generate_prompt]
         )
-        feedback = response.text.strip()
-        print(f"[AI Feedback] Generated for '{component_name}': {feedback[:50]}...")
-        return feedback
+        suggestions_response = extract_and_parse_json(response.text)
+        if suggestions_response is None or "suggestions" not in suggestions_response:
+            suggestions_response = {"suggestions": [
+                f"基于{component_name}的外形特征，可以进一步优化细节设计。",
+                f"考虑{component_name}的功能需求，建议提升实用性。",
+                f"从结构角度，可以优化{component_name}的连接方式。"
+            ]}
+        suggestions = suggestions_response.get("suggestions", [])
+        print(f"[AI Feedback] Generated {len(suggestions)} suggestions for '{component_name}'")
     except Exception as e:
-        print(f"[AI Feedback] Error generating feedback: {e}")
-        # 异常时也直接给建议，不询问
-        if component_memory.get("appearance") or component_memory.get("function"):
-            return f"基于已记录的{component_name}设计信息，建议进一步明确细节需求。"
-        return f"关于{component_name}的设计，可以从外形、功能或结构方面进一步深化。"
+        print(f"[AI Feedback] Error generating suggestions: {e}")
+        suggestions = [
+            f"基于{component_name}的外形特征，可以进一步优化细节设计。",
+            f"考虑{component_name}的功能需求，建议提升实用性。",
+            f"从结构角度，可以优化{component_name}的连接方式。"
+        ]
+
+    # 6. 对每个建议进行评分
+    scored_suggestions = []
+    for suggestion in suggestions:
+        scores = evaluate_suggestion(
+            component_name=component_name,
+            user_intent=user_intent,
+            behavior_description=behavior_description,
+            user_speaking=user_speaking,
+            ai_suggestion=suggestion
+        )
+        # 计算加权总分
+        total_score = (
+            scores["Novelty"] * EVALUATION_WEIGHTS["Novelty"] +
+            scores["Value"] * EVALUATION_WEIGHTS["Value"] +
+            scores["Feasibility"] * EVALUATION_WEIGHTS["Feasibility"] +
+            scores["Context-specific"] * EVALUATION_WEIGHTS["Context-specific"]
+        ) / sum(EVALUATION_WEIGHTS.values())
+
+        scored_suggestions.append({
+            "content": suggestion,
+            "scores": scores,
+            "total_score": round(total_score, 1)
+        })
+
+    # 7. 找出得分最高的建议
+    best_suggestion = max(scored_suggestions, key=lambda x: x["total_score"])
+
+    return best_suggestion
+
+
+def evaluate_suggestion(
+    component_name: str,
+    user_intent: str,
+    behavior_description: str,
+    user_speaking: str,
+    ai_suggestion: str
+) -> dict:
+    """
+    对单个建议进行四维度评分。
+
+    Args:
+        component_name: 部件名称
+        user_intent: 用户意图
+        behavior_description: 行为描述
+        user_speaking: 用户说的话
+        ai_suggestion: AI建议内容
+
+    Returns:
+        dict: {"Novelty": 85, "Value": 90, "Feasibility": 75, "Context-specific": 88}
+    """
+    from record import client
+
+    evaluate_prompt = f'''
+你是一个专业的设计专家评估器，负责对"Intentrelay设计助手"给出的 AI 反馈进行打分。请根据以下四个维度进行百分制评价。
+
+请结合以下内容进行评估：
+当前设计对象：{component_name}
+当前设计意图：{user_intent}
+当前设计描述：{behavior_description}
+当前用户表述：{user_speaking if user_speaking else "（用户没有说话）"}
+AI建议：{ai_suggestion}
+
+## 评分规则
+请根据反馈质量在以下连续区间内给出具体分数：
+[70 - 100分] 卓越：符合高分案例描述，提供了突破性、参数级或精准对位的建议。
+[30 - 70分] 合格：符合中等案例描述，提供了常规补充或逻辑延伸建议。
+[0 - 30分] 低效：符合低等案例描述，属于复读、空泛或不相关的反馈。
+
+## 详细打分案例参考
+
+### ① 新颖性 (Novelty)
+AI 给出的内容是否包含当前尚未被用户明确提出、但对当前设计有意义的新信息或新方向。
+
+[0 - 30分]：完全不新颖——AI 只是重复用户刚刚说过的话，或者转述当前状态，没有新增内容。
+[30 - 70分]：中等新颖性——AI 在用户原有想法上做了一点补充。
+[70 - 100分]：高新颖性——AI 提出了当前没有被提到、并且能明显拓展用户思路的新信息、新方向。
+
+### ② 价值性 (Value)
+反馈是否真的有助于当前设计任务，能改善功能、外形、结构，辅助探索。
+
+[0 - 30分]：低价值——反馈过于空泛，对当前任务几乎没有帮助。
+[30 - 70分]：中等价值——反馈能帮助用户意识到某个问题，或者提供一个有参考意义的方向，但推进作用有限。
+[70 - 100分]：高价值——反馈抓住了当前设计中的关键问题或关键突破点，能够明显推动任务进展。
+
+### ③ 可执行性 (Feasibility)
+反馈是否能够转化成明确的下一步修改动作。
+
+[0 - 30分]：低可执行性——反馈只是抽象评价，没有明确可操作的修改方向。
+[30 - 70分]：中等可执行性——反馈指出了修改对象和大致方向，但具体怎么修改仍然不够明确。
+[70 - 100分]：高可执行性——反馈已经能直接指导用户做出下一步修改。
+
+### ④ 上下文相关性 (Context-specific)
+给出的反馈是否贴合当前设计对象、阶段与意图。
+
+[0 - 30分]：低相关性——反馈和当前行为明显不对应。
+[30 - 70分]：中等相关性——反馈和产品整体方向有关，但没有紧贴当前的具体设计行为。
+[70 - 100分]：高相关性——反馈紧密对应当前正在修改的对象、目标或刚发生的动作。
+
+## 输出要求
+请输出JSON格式，包含四个维度的分数（0-100的整数）：
+{{
+    "Novelty": 分数,
+    "Value": 分数,
+    "Feasibility": 分数,
+    "Context-specific": 分数
+}}
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[evaluate_prompt]
+        )
+        scores = extract_and_parse_json(response.text)
+        if scores is None:
+            scores = {"Novelty": 50, "Value": 50, "Feasibility": 50, "Context-specific": 50}
+
+        # 确保四个维度都有分数
+        for key in ["Novelty", "Value", "Feasibility", "Context-specific"]:
+            if key not in scores:
+                scores[key] = 50
+            scores[key] = max(0, min(100, int(scores[key])))
+
+        return scores
+    except Exception as e:
+        print(f"[AI Feedback] Error evaluating suggestion: {e}")
+        return {"Novelty": 50, "Value": 50, "Feasibility": 50, "Context-specific": 50}
+
+
+# ========== 用户反馈处理函数 ==========
+
+def process_user_feedback(user_feedback: str) -> dict:
+    """
+    处理用户反馈，分析对各维度的偏好，并更新评分权重。
+
+    Args:
+        user_feedback: 用户的反馈文本（如"我觉得可以更新颖一些"）
+
+    Returns:
+        dict: {
+            "dimension_changes": {"Novelty": +0.1, "Feasibility": -0.1, ...},
+            "updated_weights": {"Novelty": 1.1, "Value": 1.0, ...},
+            "analysis": "LLM分析结果"
+        }
+    """
+    global EVALUATION_WEIGHTS
+
+    # 构建 LLM 分析 prompt
+    analyze_prompt = f'''
+你是一个反馈分析器，负责分析用户对AI设计建议的反馈，识别用户对不同评价维度的偏好变化。
+
+## 四个评价维度
+1. Novelty（新颖性）- 建议的创新程度、新想法
+2. Value（价值性）- 建议的实用价值、对设计的帮助
+3. Feasibility（可执行性）- 建议的可操作性、落地难度
+4. Context-specific（上下文相关性）- 建议与当前设计场景的贴合度
+
+## 用户反馈
+"{user_feedback}"
+
+## 分析规则
+1. 判断用户反馈与哪些维度相关，不相关的维度标记为 0
+2. 如果用户表达对某维度的偏好/希望加强，该维度标记为 +0.1
+3. 如果用户表达对某维度的不在意/希望降低，该维度标记为 -0.1
+4. 如果用户说降低某维度的同时暗示要提高另一维度，两者都需标记
+5. 如果反馈与所有维度都不相关，全部标记为 0
+
+## 常见表达示例
+- "可以更新颖一些" → Novelty: +0.1，其他: 0
+- "不需要搞那些花里胡哨的创新，用最稳妥、经典的方案就行。" → Novelty: -0.1，其他: 0
+- "希望能更实用一些" → Value: +0.1，其他: 0
+- "现在只是头脑风暴阶段，没必要考虑是否有用，纯发散即可。" → Value: -0.1，其他: 0
+- "要能落地执行" → Feasibility: +0.1，其他: 0
+- "不用太考虑可行性，给一些天马行空的想法" → Feasibility: -0.1, Novelty: +0.1
+- "更贴合我的设计场景" → Context-specific: +0.1，其他: 0
+- "跳出当前的业务框架，给我一些通用的、跨行业的设计灵感。" → Context-specific: -0.1，其他: 0
+- "好的，谢谢" → 全部: 0（与维度无关）
+
+## 输出要求
+请输出JSON格式：
+{{
+    "Novelty": 变化值（-0.1, 0, 或 +0.1）,
+    "Value": 变化值（-0.1, 0, 或 +0.1）,
+    "Feasibility": 变化值（-0.1, 0, 或 +0.1）,
+    "Context-specific": 变化值（-0.1, 0, 或 +0.1）,
+    "analysis": "简要分析用户的偏好倾向"
+}}
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[analyze_prompt]
+        )
+        result = extract_and_parse_json(response.text)
+
+        if result is None:
+            print("[User Feedback] Failed to parse LLM response")
+            return {
+                "dimension_changes": {},
+                "updated_weights": EVALUATION_WEIGHTS.copy(),
+                "analysis": "解析失败"
+            }
+
+        # 提取变化值
+        dimension_changes = {}
+        for key in ["Novelty", "Value", "Feasibility", "Context-specific"]:
+            change = result.get(key, 0)
+            # 确保变化值在合理范围内
+            if isinstance(change, (int, float)):
+                dimension_changes[key] = round(float(change), 1)
+            else:
+                dimension_changes[key] = 0.0
+
+        # 更新权重
+        for key, change in dimension_changes.items():
+            EVALUATION_WEIGHTS[key] = round(EVALUATION_WEIGHTS[key] + change, 2)
+            # 权重下限为 0.1，避免归零
+            if EVALUATION_WEIGHTS[key] < 0.1:
+                EVALUATION_WEIGHTS[key] = 0.1
+
+        print(f"[User Feedback] Weight changes: {dimension_changes}")
+        print(f"[User Feedback] Updated weights: {EVALUATION_WEIGHTS}")
+
+        return {
+            "dimension_changes": dimension_changes,
+            "updated_weights": EVALUATION_WEIGHTS.copy(),
+            "analysis": result.get("analysis", "")
+        }
+
+    except Exception as e:
+        print(f"[User Feedback] Error processing feedback: {e}")
+        return {
+            "dimension_changes": {},
+            "updated_weights": EVALUATION_WEIGHTS.copy(),
+            "analysis": f"处理出错: {str(e)}"
+        }
+
+
+def get_current_weights() -> dict:
+    """获取当前的评分权重"""
+    return EVALUATION_WEIGHTS.copy()
+
+
+def reset_weights():
+    """重置评分权重为默认值"""
+    global EVALUATION_WEIGHTS
+    EVALUATION_WEIGHTS = {
+        "Novelty": 1.0,
+        "Value": 1.0,
+        "Feasibility": 1.0,
+        "Context-specific": 1.0
+    }
+    print("[User Feedback] Weights reset to default")

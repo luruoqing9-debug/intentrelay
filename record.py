@@ -4,6 +4,13 @@ record.py - 记录处理模块
 """
 
 import os
+import sys
+
+# 设置 Windows 控制台编码为 UTF-8
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # 设置 HuggingFace 镜像（解决国内连接问题）
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -122,31 +129,34 @@ PhysicalTriggerType = Literal[
 
 # ========== 物理世界Prompt构建 ==========
 
-def get_physical_analysis_prompt(trigger_type: PhysicalTriggerType, transcript_text: str) -> str:
+def get_physical_analysis_prompt(trigger_types: list[PhysicalTriggerType], transcript_text: str) -> str:
     """
-    构建物理世界分析的Prompt，整合触发类型和语音文本。
+    构建物理世界分析的Prompt，整合触发类型列表和语音文本。
 
     Args:
-        trigger_type: 物理世界触发类型（眼动注视/手部交互/语音触发）
+        trigger_types: 物理世界触发类型列表（支持多种触发同时发生）
         transcript_text: 语音转文本结果（如无语音则为空字符串）
 
     Returns:
         VLM分析用的Prompt字符串
     """
+    # 将触发类型列表转为字符串描述
+    trigger_desc = "、".join(trigger_types) if trigger_types else "无"
+
     prompt = f'''
 You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in physical space, specializing in visual analysis. Your task is to analyze the provided images, trigger context, and user voice, then determine the user's current behavioral intention.
 
 Based on your analysis, you must generate a JSON object with the following keys. Your entire response must be ONLY the JSON object, with no introductory text or explanations.
 
 ### [Input Context]
-- Trigger Type: {trigger_type}
+- Trigger Types: {trigger_desc}（多种触发同时发生，需综合分析）
 - User Voice (Transcript): {transcript_text}
 
 ### [JSON Keys]
 1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
 2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
 3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
-4. "Behavior description": A single, concise sentence describing the user's interaction based on the trigger type and visual analysis (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
+4. "Behavior description": A single, concise sentence describing the user's interaction based on the trigger types and visual analysis (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
 5. "User intent": Classify the intent into EXACTLY one of the following strings:
     - "Appearance design": Related to visual form, proportions, materials, or surface details.
     - "Functional concept": Related to functional objectives or improving features.
@@ -159,19 +169,19 @@ Based on your analysis, you must generate a JSON object with the following keys.
 
 # ========== VLM分析函数 ==========
 
-def vlm_chat_mock(image_bytes: str, trigger_type: PhysicalTriggerType, transcript_text: str) -> str:
+def vlm_chat_mock(image_bytes: str, trigger_types: list[PhysicalTriggerType], transcript_text: str) -> str:
     """
-    使用VLM分析物理世界的图像、触发类型和语音文本，返回JSON格式的分析结果。
+    使用VLM分析物理世界的图像、触发类型列表和语音文本，返回JSON格式的分析结果。
 
     Args:
         image_bytes: Base64编码的图像
-        trigger_type: 物理世界触发类型
+        trigger_types: 物理世界触发类型列表（多种触发同时发生时合并为一次分析）
         transcript_text: 语音转文本结果
 
     Returns:
         JSON字符串，包含 type, label, User Speaking, Behavior description, User intent
     """
-    prompt = get_physical_analysis_prompt(trigger_type, transcript_text)
+    prompt = get_physical_analysis_prompt(trigger_types, transcript_text)
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=[
@@ -183,6 +193,117 @@ def vlm_chat_mock(image_bytes: str, trigger_type: PhysicalTriggerType, transcrip
         ]
     )
     return response.text
+
+
+# ========== 统一输入接口 ==========
+
+TriggerMode = Literal[0, 1, 2]
+# 0: 物理世界触发
+# 1: 部件生成（虚拟触发）
+# 2: 整体生成（虚拟触发）
+
+MicMode = Literal[0, 1]
+# mico=0: 麦克风关闭，语音用于触发VLM分析（自言自语）
+# mico=1: 麦克风开启，语音用于LLM问答
+
+
+def process_user_input(
+    t: TriggerMode,
+    mico: MicMode = 0,
+    image_bytes: str = None,
+    virtual_json: dict = None,
+    record_duration: float = 5.0
+) -> str:
+    """
+    统一输入接口：根据 t 和 mico 值决定处理方式。
+
+    Args:
+        t: 触发模式
+            - 0: 物理世界触发（需要 image_bytes）
+            - 1: 部件生成（虚拟触发，需要 virtual_json）
+            - 2: 整体生成（虚拟触发，需要 virtual_json）
+        mico: 麦克风模式
+            - 0: 麦克风关闭，语音用于触发VLM分析
+            - 1: 麦克风开启，语音用于LLM问答
+        image_bytes: Base64编码的图像（t=0 时必需）
+        virtual_json: 虚拟界面操作数据（t=1或2 时必需）
+        record_duration: 录音时长（秒）
+
+    Returns:
+        JSON字符串，包含分析结果
+    """
+    from speech import get_transcript_from_mic
+
+    # 录音获取文本
+    print(f"[Input] Mode t={t}, mico={mico}, Recording for {record_duration} seconds...")
+    transcript_text = get_transcript_from_mic(record_duration)
+    print(f"[Input] Transcript: '{transcript_text}'")
+
+    # 根据 mico 值决定处理方式
+    if mico == 1:
+        # 麦克风开启：语音用于LLM问答
+        return process_user_question(transcript_text)
+
+    else:
+        # mico=0：麦克风关闭，语音用于触发VLM分析
+        if t == 0:
+            # 物理世界触发
+            if image_bytes is None:
+                print("[Input] Error: image_bytes required for t=0")
+                return ""
+
+            trigger_types = ["语音输入触发"]
+            return vlm_chat_mock(image_bytes, trigger_types, transcript_text)
+
+        elif t == 1:
+            # 部件生成（虚拟触发）
+            if virtual_json is None:
+                print("[Input] Error: virtual_json required for t=1")
+                return ""
+
+            trigger_type = "部件生成语音触发"
+            return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+
+        elif t == 2:
+            # 整体生成（虚拟触发）
+            if virtual_json is None:
+                print("[Input] Error: virtual_json required for t=2")
+                return ""
+
+            trigger_type = "整体生成语音触发"
+            return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+
+        else:
+            print(f"[Input] Error: Invalid t value: {t}")
+            return ""
+
+
+def process_user_question(question: str) -> str:
+    """
+    处理用户提问（mico=1时调用），让LLM生成回答。
+
+    Args:
+        question: 用户的问题文本
+
+    Returns:
+        LLM的回答内容
+    """
+    prompt = f'''
+你是一个专业的设计助手，正在协助用户进行产品设计。请回答用户的问题，给出简洁、专业的建议。
+
+用户问题：{question}
+
+请直接回答，不要有多余的开场白。
+'''
+
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=[prompt]
+    )
+
+    answer = response.text
+    print(f"[LLM Answer] {answer}")
+    return answer
 
 
 def vlm_chat_virtual(virtual_json: dict, trigger_type: str, transcript_text: str) -> str:

@@ -4,6 +4,15 @@ Memory.py - 记忆节点与管理模块
 依赖：record.py（编码、VLM、存储函数）
 """
 
+import sys
+import os
+
+# 设置 Windows 控制台编码为 UTF-8
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
