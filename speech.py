@@ -1,388 +1,479 @@
 """
-speech.py - 语音录制与转文本模块
-包含：录音、语音转文本功能（支持科大讯飞）
+speech.py - 实时语音转写（科大讯飞RTASR）
+支持两种模式：
+- mico=0：分贝检测模式，自动触发回调
+- mico=1：持续发送模式，手动获取文本
 """
 
-import os
 import sys
+import os
 
-# 设置 Windows 控制台编码为 UTF-8
-if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8')
-
-import wave
-import tempfile
-import base64
-import hashlib
-import hmac
-import datetime
-import json
-import ssl
-from urllib.parse import urlencode, urlparse
 from dotenv import load_dotenv
 load_dotenv()
 
-# 语音转文本方案选择
-STT_PROVIDER = os.environ.get("STT_PROVIDER", "xunfei")  # xunfei / whisper / google / local_whisper
-
-# ========== 科大讯飞语音转文本 ==========
-
-XUNFEI_APPID = os.environ.get("XUNFEI_APPID", "")
-XUNFEI_API_KEY = os.environ.get("XUNFEI_API_KEY", "")
-XUNFEI_API_SECRET = os.environ.get("XUNFEI_API_SECRET", "")
-
-
-def create_xunfei_url() -> str:
-    """生成科大讯飞 WebSocket 认证 URL"""
-    base_url = "wss://ws-api.xfyun.cn/v2/iat"
-
-    # 生成鉴权参数
-    now = datetime.datetime.now().strftime("%a, %d %b %Y %H:%M:%S GMT")
-
-    signature_origin = f"host: ws-api.xfyun.cn\ndate: {now}\nGET /v2/iat HTTP/1.1"
-    signature_sha = hmac.new(
-        XUNFEI_API_SECRET.encode('utf-8'),
-        signature_origin.encode('utf-8'),
-        hashlib.sha256
-    ).digest()
-    signature = base64.b64encode(signature_sha).decode(encoding='utf-8')
-
-    authorization_origin = f"api_key=\"{XUNFEI_API_KEY}\", algorithm=\"hmac-sha256\", headers=\"host date request-line\", signature=\"{signature}\""
-    authorization = base64.b64encode(authorization_origin.encode('utf-8')).decode(encoding='utf-8')
-
-    params = {
-        "authorization": authorization,
-        "date": now,
-        "host": "ws-api.xfyun.cn"
-    }
-
-    return base_url + "?" + urlencode(params)
-
-
-def transcribe_with_xunfei(audio_data: bytes) -> str:
-    """使用科大讯飞语音听写 API 转文本"""
-    import websocket
-
-    if not XUNFEI_APPID or not XUNFEI_API_KEY or not XUNFEI_API_SECRET:
-        print("[Speech] Error: XUNFEI credentials not set (APPID, API_KEY, API_SECRET)")
-        return ""
-
-    ws_url = create_xunfei_url()
-    transcript_result = []
-
-    def on_message(ws, message):
-        # 确保 message 是字符串（WebSocket 可能返回 bytes）
-        if isinstance(message, bytes):
-            message = message.decode('utf-8')
-
-        data = json.loads(message)
-        if data.get("code", 0) != 0:
-            print(f"[Xunfei] Error: {data.get('code')} - {data.get('message')}")
-            ws.close()
-            return
-
-        # 解码结果
-        result_data = data.get("data", {})
-        if result_data:
-            status = result_data.get("status", 0)
-            result = result_data.get("result", {})
-
-            # 解析识别结果
-            ws_list = result.get("ws", [])
-            for ws_item in ws_list:
-                for cw in ws_item.get("cw", []):
-                    w = cw.get("w", "")
-                    transcript_result.append(w)
-
-            # status: 0-首帧, 1-中间帧, 2-最后一帧
-            if status == 2:
-                ws.close()
-
-    def on_error(ws, error):
-        print(f"[Xunfei] WebSocket error: {error}")
-
-    def on_close(ws, close_status_code, close_msg):
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except:
         pass
 
-    def on_open(ws):
-        # 发送第一帧（包含业务参数）
-        first_frame = {
-            "common": {
-                "app_id": XUNFEI_APPID
-            },
-            "business": {
-                "language": "zh_cn",  # 中文
-                "domain": "iat",      # 通用听写
-                "accent": "mandarin", # 普通话
-                "vad_eos": 2000,      # 静音检测超时（毫秒）
-                "dwa": "wpgs"         # 动态修正
-            },
-            "data": {
-                "status": 0,
-                "format": "audio/L16;rate=16000",
-                "encoding": "raw",
-                "audio": base64.b64encode(audio_data[:1280]).decode('utf-8')
-            }
-        }
-        ws.send(json.dumps(first_frame))
-
-        # 发送中间帧
-        chunk_size = 1280
-        offset = chunk_size
-        while offset < len(audio_data):
-            chunk = audio_data[offset:offset + chunk_size]
-            middle_frame = {
-                "data": {
-                    "status": 1,
-                    "format": "audio/L16;rate=16000",
-                    "encoding": "raw",
-                    "audio": base64.b64encode(chunk).decode('utf-8')
-                }
-            }
-            ws.send(json.dumps(middle_frame))
-            offset += chunk_size
-
-        # 发送最后一帧
-        last_frame = {
-            "data": {
-                "status": 2,
-                "format": "audio/L16;rate=16000",
-                "encoding": "raw",
-                "audio": base64.b64encode(audio_data[offset:]).decode('utf-8') if offset < len(audio_data) else ""
-            }
-        }
-        ws.send(json.dumps(last_frame))
-
-    # WebSocket 连接
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-        on_open=on_open
-    )
-
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-
-    transcript = "".join(transcript_result)
-    print(f"[Speech] Result: '{transcript}'")
-    return transcript
-
-def transcribe_with_whisper(audio_path: str) -> str:
-    """使用 OpenAI Whisper API 转文本"""
-    from openai import OpenAI
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("[Speech] Error: OPENAI_API_KEY not set")
-        return ""
-
-    client = OpenAI(api_key=api_key)
-
-    with open(audio_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            language="zh"  # 中文
-        )
-
-    print(f"[Whisper] Transcribed: '{transcript.text}'")
-    return transcript.text
-
-
-# ========== Google Speech-to-Text 方案 ==========
-
-def transcribe_with_google(audio_path: str) -> str:
-    """使用 Google Cloud Speech-to-Text"""
-    from google.cloud import speech_v1
-
-    client = speech_v1.SpeechClient()
-
-    # 读取音频文件
-    with open(audio_path, "rb") as audio_file:
-        content = audio_file.read()
-
-    audio = speech_v1.RecognitionAudio(content=content)
-    config = speech_v1.RecognitionConfig(
-        encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
-        language_code="zh-CN",
-        enable_automatic_punctuation=True
-    )
-
-    response = client.recognize(config=config, audio=audio)
-
-    transcript = ""
-    for result in response.results:
-        transcript += result.alternatives[0].transcript
-
-    print(f"[Google STT] Transcribed: '{transcript}'")
-    return transcript
-
-
-# ========== 本地 Whisper 模型方案 ==========
-
-def transcribe_with_local_whisper(audio_path: str) -> str:
-    """使用本地 Whisper 模型（无需 API key）"""
-    import whisper
-
-    # 加载模型（base 模型平衡速度和精度）
-    model = whisper.load_model("base")
-
-    result = model.transcribe(audio_path, language="zh")
-    transcript = result["text"]
-
-    print(f"[Local Whisper] Transcribed: '{transcript}'")
-    return transcript
-
-
-# ========== 统一转文本接口 ==========
-
-def transcribe_audio(audio_data: bytes) -> str:
-    """
-    将音频数据转为文本。
-
-    Args:
-        audio_data: 音频原始数据（bytes）
-
-    Returns:
-        转录的文本内容
-    """
-    provider = STT_PROVIDER.lower()
-
-    if provider == "xunfei":
-        return transcribe_with_xunfei(audio_data)
-    else:
-        print(f"[Speech] Provider '{provider}' requires file path, fallback to xunfei")
-        return transcribe_with_xunfei(audio_data)
-
-
-# ========== 录音功能 ==========
-
-import pyaudio
+import time
 import threading
+import hashlib
+import hmac
+import base64
+import json
+import pyaudio
+import numpy as np
+from urllib.parse import quote
+import websocket
 
-# 录音参数
-CHUNK = 1024
+# ========== 讯飞配置 ==========
+APPID = "3e3c8301"
+API_KEY = "6d81482eb1e976f3402e20e69684f6a2"
+
+print(f"[speech.py] 讯飞配置: APPID={APPID}, API_KEY已设置")
+
+# ========== 音频参数 ==========
+CHUNK = 1280
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 
-# 录音状态
-_is_recording = False
-_audio_frames = []
-_recording_thread = None
+# ========== 分贝检测参数（仅 mico=0 使用）==========
+DB_THRESHOLD = 30  # 分贝阈值
+SILENCE_DURATION = 1.0  # 连续静音时长（秒）后停止
 
+# ========== 模式状态 ==========
+_current_mico = 0  # 当前模式，默认 mico=0
 
-def _record_audio_async():
-    """异步录音线程"""
-    global _audio_frames
-
-    p = pyaudio.PyAudio()
-
-    stream = p.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK
-    )
-
-    print("[Speech] Recording started...")
-
-    while _is_recording:
-        data = stream.read(CHUNK, exception_on_overflow=False)
-        _audio_frames.append(data)
-
-    print("[Speech] Recording stopped.")
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-
-
-def start_recording():
-    """开始录音"""
-    global _is_recording, _audio_frames, _recording_thread
-
-    if _is_recording:
-        print("[Speech] Already recording!")
-        return
-
-    _is_recording = True
-    _audio_frames = []
-    _recording_thread = threading.Thread(target=_record_audio_async)
-    _recording_thread.start()
-
-
-def stop_recording() -> bytes:
+def set_mico_mode(mode: int):
     """
-    停止录音，返回音频数据。
-
-    Returns:
-        音频原始数据（bytes）
-    """
-    global _is_recording, _audio_frames, _recording_thread
-
-    if not _is_recording:
-        print("[Speech] Not recording!")
-        return b""
-
-    _is_recording = False
-    _recording_thread.join()
-
-    audio_data = b"".join(_audio_frames)
-    print(f"[Speech] Recording stopped, {len(audio_data)} bytes")
-    return audio_data
-
-
-def record_and_transcribe(duration: float = None) -> str:
-    """
-    录音并转文本（一键式接口）。
+    设置当前模式
 
     Args:
-        duration: 录音时长（秒），为 None 则需要手动调用 stop_recording
-
-    Returns:
-        转录的文本内容
+        mode: 0 = 分贝检测模式（自动触发），1 = 持续发送模式（手动获取）
     """
-    start_recording()
+    global _current_mico
+    _current_mico = mode
+    print(f"[speech] 模式切换: mico={mode}")
 
-    if duration:
-        import time
-        time.sleep(duration)
-        audio_data = stop_recording()
-    else:
-        # 等待用户手动停止（需要外部调用 stop_recording）
-        print("[Speech] Call stop_recording() to finish recording")
+def get_mico_mode() -> int:
+    """获取当前模式"""
+    return _current_mico
+
+
+# ========== 回调函数 ==========
+_on_speech_end_callback = None
+
+def set_speech_end_callback(callback):
+    """设置语音结束回调函数（仅 mico=0 模式使用）"""
+    global _on_speech_end_callback
+    _on_speech_end_callback = callback
+
+
+def calculate_db(audio_data: bytes) -> float:
+    """计算音频数据的分贝值"""
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+
+    if len(audio_array) == 0:
+        return 0
+
+    rms = np.sqrt(np.mean(audio_array ** 2))
+
+    if rms == 0:
+        return 0
+
+    db = 20 * np.log10(rms / 32767.0) + 100
+
+    return max(0, min(100, db))
+
+
+class RTASRClient:
+    """实时语音转写客户端"""
+
+    def __init__(self):
+        self.ws = None
+        self.running = False
+        self.all_text = ""
+        self.current_sentence = ""
+        self.trecv = None
+        self.tsend = None
+        self.end_tag = "{\"end\": true}"
+        self.handshake_done = False  # WebSocket握手是否完成
+
+        # 分贝检测状态（仅 mico=0 使用）
+        self.is_speaking = False
+        self.silence_start_time = None
+
+    def _get_url(self):
+        """讯飞 RTASR 签名算法"""
+        base_url = "ws://rtasr.xfyun.cn/v1/ws"
+        ts = str(int(time.time()))
+
+        tt = (APPID + ts).encode('utf-8')
+        md5 = hashlib.md5()
+        md5.update(tt)
+        baseString = md5.hexdigest()
+        baseString = bytes(baseString, encoding='utf-8')
+
+        apiKey = API_KEY.encode('utf-8')
+        signa = hmac.new(apiKey, baseString, hashlib.sha1).digest()
+        signa = base64.b64encode(signa)
+        signa = str(signa, 'utf-8')
+
+        url = base_url + "?appid=" + APPID + "&ts=" + ts + "&signa=" + quote(signa)
+        return url
+
+    def start(self):
+        """启动语音识别"""
+        self.running = True
+        self.all_text = ""
+        self.current_sentence = ""
+        self.is_speaking = False
+        self.silence_start_time = None
+        self.handshake_done = False
+
+        url = self._get_url()
+        print(f"【连接WebSocket】")
+        self.ws = websocket.create_connection(url)
+
+        self.trecv = threading.Thread(target=self._recv, daemon=True)
+        self.trecv.start()
+
+        self.tsend = threading.Thread(target=self._send_mic, daemon=True)
+        self.tsend.start()
+
+        mode_str = "分贝检测" if _current_mico == 0 else "持续发送"
+        print(f"【语音识别已启动】模式: mico={_current_mico} ({mode_str})")
+
+    def stop(self):
+        """停止语音识别"""
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.send(bytes(self.end_tag.encode('utf-8')))
+                self.ws.close()
+            except:
+                pass
+
+    def _send_mic(self):
+        """从麦克风录音，根据模式决定发送逻辑"""
+        p = pyaudio.PyAudio()
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                       input=True, frames_per_buffer=CHUNK)
+
+        print(f"【监听麦克风】等待握手完成...")
+
+        # 等待握手完成
+        handshake_wait = 0
+        while not self.handshake_done and self.running and handshake_wait < 10:
+            time.sleep(0.1)
+            handshake_wait += 0.1
+
+        if not self.handshake_done:
+            print("【握手超时】连接失败")
+            stream.close()
+            p.terminate()
+            return
+
+        print(f"【握手完成】开始监听")
+
+        while self.running:
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+
+                if _current_mico == 1:
+                    # mico=1 模式：持续发送，不做分贝检测
+                    if self.ws and self.handshake_done:
+                        self.ws.send(data)
+
+                else:
+                    # mico=0 模式：分贝检测
+                    db = calculate_db(data)
+
+                    if db >= DB_THRESHOLD:
+                        # 音量高于阈值 → 正在说话
+                        if not self.is_speaking:
+                            print(f"【开始说话】分贝={db:.1f}")
+                            self.is_speaking = True
+
+                        self.silence_start_time = None
+
+                        # 发送音频数据给讯飞（确保握手完成）
+                        if self.ws and self.handshake_done:
+                            self.ws.send(data)
+
+                    else:
+                        # 音量低于阈值
+                        # 即使不说话，也发送静音数据保持连接活跃
+                        if self.ws and self.handshake_done:
+                            self.ws.send(data)
+
+                        if self.is_speaking:
+                            if self.silence_start_time is None:
+                                self.silence_start_time = time.time()
+                            else:
+                                elapsed = time.time() - self.silence_start_time
+                                if elapsed >= SILENCE_DURATION:
+                                    # 连续静音超过阈值，说话结束
+                                    print(f"【说话结束】静音{elapsed:.1f}秒")
+                                    self.is_speaking = False
+
+                                    # 触发回调
+                                    self._trigger_callback()
+
+                                    # 重置状态，准备下一次说话
+                                    self.all_text = ""
+                                    self.current_sentence = ""
+                                    self.silence_start_time = None
+
+            except Exception as e:
+                print(f"【发送错误】{e}")
+                break
+
+            time.sleep(0.04)
+
+        stream.close()
+        p.terminate()
+
+    def _trigger_callback(self):
+        """触发语音结束回调（仅 mico=0）"""
+        global _on_speech_end_callback
+
+        # 使用 get_text() 获取完整文本（包括中间结果）
+        final_text = self.get_text().strip()
+
+        if final_text and len(final_text) > 5:
+            print(f"【回调触发】文本: '{final_text}'")
+            if _on_speech_end_callback:
+                try:
+                    _on_speech_end_callback(final_text)
+                except Exception as e:
+                    print(f"【回调错误】{e}")
+        else:
+            print(f"【回调跳过】文本太短或为空: '{final_text}'")
+
+    def _recv(self):
+        """接收转写结果（支持自动重连）"""
+        while self.running:
+            try:
+                while self.ws and self.ws.connected and self.running:
+                    result = str(self.ws.recv())
+                    if len(result) == 0:
+                        print("【接收结束】")
+                        break
+
+                    result_dict = json.loads(result)
+
+                    if result_dict["action"] == "started":
+                        self.handshake_done = True
+                        print("【握手成功】")
+
+                    elif result_dict["action"] == "result":
+                        # 忽略握手前的结果
+                        if not self.handshake_done:
+                            continue
+
+                        data_str = result_dict.get("data", "")
+                        if data_str:
+                            try:
+                                data_json = json.loads(data_str)
+                                cn = data_json.get("cn", {})
+                                st = cn.get("st", {})
+                                rt_list = st.get("rt", [])
+
+                                text = ""
+                                for rt in rt_list:
+                                    for ws_item in rt.get("ws", []):
+                                        for cw in ws_item.get("cw", []):
+                                            text += cw.get("w", "")
+
+                                if text:
+                                    result_type = st.get("type", "1")
+                                    text_stripped = text.strip()
+
+                                    # 过滤语气词
+                                    meaningless = ["嗯", "啊", "呃", "额", "唔", "噢", "哦", "哈", "恩"]
+                                    should_filter = any(text_stripped == w or
+                                                       (len(text_stripped) > 0 and all(c == w[0] for c in text_stripped))
+                                                       for w in meaningless)
+
+                                    if should_filter:
+                                        if result_type == "0":
+                                            self.current_sentence = ""
+                                        print(f"○ 过滤语气词: {text}")
+                                    elif result_type == "0":
+                                        if len(text_stripped) <= 5:
+                                            print(f"○ 过滤短文本: {text}")
+                                        else:
+                                            self.all_text += text
+                                            print(f"✓ 最终: {text}")
+                                        self.current_sentence = ""
+                                    else:
+                                        self.current_sentence = text
+                                        print(f"~ 中间: {text}")
+
+                            except Exception as e:
+                                print(f"【解析失败】{e}")
+
+                    elif result_dict["action"] == "error":
+                        print("【错误】" + result)
+                        # 超时错误，退出内层循环触发重连
+                        if "idle timeout" in result and self.running:
+                            print("【超时重连】...")
+                            break
+                        else:
+                            break
+
+            except websocket.WebSocketConnectionClosedException:
+                print("【连接关闭】")
+                if self.running:
+                    self._reconnect()
+
+            except Exception as e:
+                print(f"【接收异常】{e}")
+                if self.running:
+                    self._reconnect()
+
+    def _reconnect(self):
+        """重新连接 WebSocket"""
+        try:
+            time.sleep(1)
+            if self.ws:
+                try:
+                    self.ws.close()
+                except:
+                    pass
+
+            url = self._get_url()
+            self.ws = websocket.create_connection(url)
+            self.handshake_done = False
+
+            # 等待握手
+            wait_time = 0
+            while not self.handshake_done and wait_time < 5:
+                time.sleep(0.1)
+                try:
+                    result = str(self.ws.recv())
+                    if len(result) > 0:
+                        result_dict = json.loads(result)
+                        if result_dict["action"] == "started":
+                            self.handshake_done = True
+                            print("【重连成功】")
+                except:
+                    pass
+                wait_time += 0.1
+
+            if not self.handshake_done:
+                print("【重连失败】")
+
+        except Exception as e:
+            print(f"【重连异常】{e}")
+
+    def get_text(self):
+        return self.all_text + self.current_sentence
+
+    def clear_text(self):
+        self.all_text = ""
+        self.current_sentence = ""
+
+
+# ========== 全局管理器 ==========
+
+_speech_client = None
+_speech_running = False
+_speech_lock = threading.Lock()
+
+
+def start_continuous_speech():
+    """启动持续语音识别"""
+    global _speech_client, _speech_running
+
+    with _speech_lock:
+        if _speech_running:
+            print("【语音识别已在运行】")
+            return
+
+        _speech_running = True
+        _speech_client = RTASRClient()
+        _speech_client.start()
+
+
+def stop_continuous_speech():
+    """停止语音识别"""
+    global _speech_client, _speech_running
+
+    with _speech_lock:
+        if not _speech_running:
+            return
+
+        _speech_running = False
+        if _speech_client:
+            _speech_client.stop()
+            _speech_client = None
+
+
+def get_accumulated_text() -> str:
+    """获取累积文本"""
+    global _speech_client
+
+    with _speech_lock:
+        if _speech_client:
+            return _speech_client.get_text().strip()
         return ""
 
-    if audio_data:
-        return transcribe_with_xunfei(audio_data)
-    return ""
+
+def clear_accumulated_text():
+    """清空累积文本"""
+    global _speech_client
+
+    with _speech_lock:
+        if _speech_client:
+            _speech_client.clear_text()
 
 
-# ========== 便捷函数 ==========
+def is_speech_running() -> bool:
+    """检查是否运行"""
+    with _speech_lock:
+        return _speech_running
 
-def get_transcript_from_mic(duration: float = 5.0) -> str:
-    """
-    从麦克风录音并转文本（最简单的接口）。
 
-    Args:
-        duration: 录音时长（秒）
+def has_speech_text() -> bool:
+    """检查是否有文本"""
+    return len(get_accumulated_text()) > 0
 
-    Returns:
-        转录的文本内容
-    """
-    print(f"[Speech] Recording for {duration} seconds...")
-    return record_and_transcribe(duration)
+
+def get_text_and_clear() -> str:
+    """获取并清空文本"""
+    text = get_accumulated_text()
+    clear_accumulated_text()
+    return text
 
 
 # ========== 测试 ==========
 
 if __name__ == "__main__":
-    # 测试录音和转文本
-    print("=== Speech Module Test ===")
-    print("Speak now... (5 seconds)")
+    print("=" * 40)
+    print("双模式语音识别测试")
+    print("=" * 40)
+    print(f"分贝阈值: {DB_THRESHOLD}")
+    print(f"静音时长: {SILENCE_DURATION}秒")
 
-    transcript = get_transcript_from_mic(5.0)
-    print(f"\nResult: {transcript}")
+    def on_end(text):
+        print(f"\n>>> VLM触发: '{text}' <<<\n")
+
+    set_speech_end_callback(on_end)
+    set_mico_mode(0)  # 默认 mico=0
+
+    print("\n当前模式: mico=0 (分贝检测)")
+    print("说话测试...")
+
+    start_continuous_speech()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n【停止】")
+        stop_continuous_speech()
