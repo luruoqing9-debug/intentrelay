@@ -230,7 +230,25 @@ class RTASRClient:
 
             except Exception as e:
                 print(f"【发送错误】{e}")
-                break
+                # 不直接退出，等待重连
+                if self.running:
+                    print("【发送线程】等待重连...")
+                    reconnect_wait = 0
+                    while self.running and reconnect_wait < 5:
+                        time.sleep(0.1)
+                        reconnect_wait += 0.1
+                        # 检查 ws 存在且握手完成
+                        if self.ws and self.handshake_done:
+                            print("【发送线程】检测到新连接，继续监听")
+                            break
+
+                    if self.ws and self.handshake_done:
+                        continue
+                    else:
+                        print("【发送线程】重连失败，退出")
+                        break
+                else:
+                    break
 
             time.sleep(0.04)
 
@@ -258,73 +276,76 @@ class RTASRClient:
         """接收转写结果（支持自动重连）"""
         while self.running:
             try:
-                while self.ws and self.ws.connected and self.running:
-                    result = str(self.ws.recv())
-                    if len(result) == 0:
-                        print("【接收结束】")
-                        break
+                # 等待 ws 存在
+                if not self.ws:
+                    time.sleep(0.1)
+                    continue
 
-                    result_dict = json.loads(result)
+                # 直接尝试接收，不检查 connected 属性
+                result = str(self.ws.recv())
+                if len(result) == 0:
+                    print("【接收结束】")
+                    if self.running:
+                        self._reconnect()
+                    continue
 
-                    if result_dict["action"] == "started":
-                        self.handshake_done = True
-                        print("【握手成功】")
+                result_dict = json.loads(result)
 
-                    elif result_dict["action"] == "result":
-                        # 忽略握手前的结果
-                        if not self.handshake_done:
-                            continue
+                if result_dict["action"] == "started":
+                    self.handshake_done = True
+                    print("【握手成功】")
 
-                        data_str = result_dict.get("data", "")
-                        if data_str:
-                            try:
-                                data_json = json.loads(data_str)
-                                cn = data_json.get("cn", {})
-                                st = cn.get("st", {})
-                                rt_list = st.get("rt", [])
+                elif result_dict["action"] == "result":
+                    # 忽略握手前的结果
+                    if not self.handshake_done:
+                        continue
 
-                                text = ""
-                                for rt in rt_list:
-                                    for ws_item in rt.get("ws", []):
-                                        for cw in ws_item.get("cw", []):
-                                            text += cw.get("w", "")
+                    data_str = result_dict.get("data", "")
+                    if data_str:
+                        try:
+                            data_json = json.loads(data_str)
+                            cn = data_json.get("cn", {})
+                            st = cn.get("st", {})
+                            rt_list = st.get("rt", [])
 
-                                if text:
-                                    result_type = st.get("type", "1")
-                                    text_stripped = text.strip()
+                            text = ""
+                            for rt in rt_list:
+                                for ws_item in rt.get("ws", []):
+                                    for cw in ws_item.get("cw", []):
+                                        text += cw.get("w", "")
 
-                                    # 过滤语气词
-                                    meaningless = ["嗯", "啊", "呃", "额", "唔", "噢", "哦", "哈", "恩"]
-                                    should_filter = any(text_stripped == w or
-                                                       (len(text_stripped) > 0 and all(c == w[0] for c in text_stripped))
-                                                       for w in meaningless)
+                            if text:
+                                result_type = st.get("type", "1")
+                                text_stripped = text.strip()
 
-                                    if should_filter:
-                                        if result_type == "0":
-                                            self.current_sentence = ""
-                                        print(f"○ 过滤语气词: {text}")
-                                    elif result_type == "0":
-                                        if len(text_stripped) <= 5:
-                                            print(f"○ 过滤短文本: {text}")
-                                        else:
-                                            self.all_text += text
-                                            print(f"✓ 最终: {text}")
+                                # 过滤语气词
+                                meaningless = ["嗯", "啊", "呃", "额", "唔", "噢", "哦", "哈", "恩"]
+                                should_filter = any(text_stripped == w or
+                                                   (len(text_stripped) > 0 and all(c == w[0] for c in text_stripped))
+                                                   for w in meaningless)
+
+                                if should_filter:
+                                    if result_type == "0":
                                         self.current_sentence = ""
+                                    print(f"○ 过滤语气词: {text}")
+                                elif result_type == "0":
+                                    if len(text_stripped) <= 5:
+                                        print(f"○ 过滤短文本: {text}")
                                     else:
-                                        self.current_sentence = text
-                                        print(f"~ 中间: {text}")
+                                        self.all_text += text
+                                        print(f"✓ 最终: {text}")
+                                    self.current_sentence = ""
+                                else:
+                                    self.current_sentence = text
+                                    print(f"~ 中间: {text}")
 
-                            except Exception as e:
-                                print(f"【解析失败】{e}")
+                        except Exception as e:
+                            print(f"【解析失败】{e}")
 
-                    elif result_dict["action"] == "error":
-                        print("【错误】" + result)
-                        # 超时错误，退出内层循环触发重连
-                        if "idle timeout" in result and self.running:
-                            print("【超时重连】...")
-                            break
-                        else:
-                            break
+                elif result_dict["action"] == "error":
+                    print("【错误】" + result)
+                    if self.running:
+                        self._reconnect()
 
             except websocket.WebSocketConnectionClosedException:
                 print("【连接关闭】")
@@ -337,36 +358,25 @@ class RTASRClient:
                     self._reconnect()
 
     def _reconnect(self):
-        """重新连接 WebSocket"""
+        """重新连接 WebSocket（只创建连接，让 _recv 线程处理握手）"""
         try:
-            time.sleep(1)
+            print("【重连中】创建新连接...")
+            time.sleep(0.5)
+
+            # 关闭旧连接
             if self.ws:
                 try:
                     self.ws.close()
                 except:
                     pass
 
+            # 创建新连接
             url = self._get_url()
             self.ws = websocket.create_connection(url)
             self.handshake_done = False
+            print("【新连接已创建】等待 _recv 线程接收握手消息...")
 
-            # 等待握手
-            wait_time = 0
-            while not self.handshake_done and wait_time < 5:
-                time.sleep(0.1)
-                try:
-                    result = str(self.ws.recv())
-                    if len(result) > 0:
-                        result_dict = json.loads(result)
-                        if result_dict["action"] == "started":
-                            self.handshake_done = True
-                            print("【重连成功】")
-                except:
-                    pass
-                wait_time += 0.1
-
-            if not self.handshake_done:
-                print("【重连失败】")
+            # 不在这里手动 recv()，让 _recv 线程自然接收握手消息
 
         except Exception as e:
             print(f"【重连异常】{e}")
