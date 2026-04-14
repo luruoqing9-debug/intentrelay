@@ -6,11 +6,10 @@ Feedback.py - AI反馈模块
 import sys
 import os
 
-# 设置 Windows 控制台编码为 UTF-8
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# 禁用警告
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+import warnings
+warnings.filterwarnings('ignore')
 
 import json
 import numpy as np

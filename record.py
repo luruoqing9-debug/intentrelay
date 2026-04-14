@@ -6,11 +6,10 @@ record.py - 记录处理模块
 import os
 import sys
 
-# 设置 Windows 控制台编码为 UTF-8
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# 禁用 transformers 警告和进度条
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # 设置 HuggingFace 镜像（解决国内连接问题）
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -25,6 +24,9 @@ import base64
 import numpy as np
 from PIL import Image
 from typing import Literal
+import warnings
+warnings.filterwarnings('ignore')
+
 from transformers import CLIPProcessor, CLIPModel
 from google import genai
 from google.genai import types
@@ -195,6 +197,122 @@ def vlm_chat_mock(image_bytes: str, trigger_types: list[PhysicalTriggerType], tr
     return response.text
 
 
+def vlm_chat_multi_images(
+    image_bytes_list: list,
+    trigger_types: list[PhysicalTriggerType],
+    transcript_text: str
+) -> str:
+    """
+    使用VLM分析多张图像（视频帧序列）、触发类型列表和语音文本，返回JSON格式的分析结果。
+
+    Args:
+        image_bytes_list: Base64编码的图像列表（多张视频帧）
+        trigger_types: 物理世界触发类型列表
+        transcript_text: 语音转文本结果
+
+    Returns:
+        JSON字符串，包含 type, label, User Speaking, Behavior description, User intent
+    """
+    trigger_desc = "、".join(trigger_types) if trigger_types else "无"
+
+    # 多图像分析的 Prompt
+    prompt = f'''
+You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior in physical space, specializing in visual analysis.
+
+You are provided with {len(image_bytes_list)} sequential video frames showing the designer's interaction over time. Analyze all frames together to understand the complete context and behavior.
+
+### [Input Context]
+- Number of Frames: {len(image_bytes_list)}
+- Trigger Types: {trigger_desc}
+- User Voice (Transcript): {transcript_text}
+
+### [Your Task]
+Based on your analysis of ALL frames, determine the user's current behavioral intention.
+
+Generate a JSON object with the following keys. Your entire response must be ONLY the JSON object:
+
+1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
+2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "base").
+3. "User Speaking": Transcribe the user's exact words from the transcript. If silent or no transcript, return "".
+4. "Behavior description": A single, concise sentence describing the user's interaction based on the video frames and trigger types (e.g., "The designer is gripping the handle to evaluate its ergonomic comfort").
+5. "User intent": Classify the intent into EXACTLY one of the following strings:
+    - "Appearance design": Related to visual form, proportions, materials, or surface details.
+    - "Functional concept": Related to functional objectives or improving features.
+    - "Structural design": Related to component relationships, layout, or adjustments.
+    - "Still-uncertain Idea Exploration": Exploratory attempts or undecided design thoughts.
+    - "Design Background supplement": Information related to goals, target users, or scenarios.
+'''
+
+    # 构建 contents：先添加所有图像，再添加 prompt
+    contents = []
+
+    for image_bytes in image_bytes_list:
+        contents.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type='image/jpeg',
+            )
+        )
+
+    contents.append(prompt)
+
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=contents
+    )
+
+    return response.text
+
+
+def vlm_chat_text_only(trigger_types: list[PhysicalTriggerType], transcript_text: str) -> str:
+    """
+    使用VLM仅分析语音文本（无图像），返回JSON格式的分析结果。
+
+    Args:
+        trigger_types: 物理世界触发类型列表
+        transcript_text: 语音转文本结果
+
+    Returns:
+        JSON字符串，包含 type, label, User Speaking, Behavior description, User intent
+    """
+    trigger_desc = "、".join(trigger_types) if trigger_types else "无"
+
+    prompt = f'''
+You are a precise and efficient artificial intelligence assistant dedicated to real-time understanding of designers' behavior and intent.
+
+You are analyzing a designer's spoken words to understand their current design intention.
+
+### [Input Context]
+- Trigger Types: {trigger_desc}
+- User Voice (Transcript): {transcript_text}
+
+### [Your Task]
+Based on the user's spoken words, determine their current design intention.
+
+Generate a JSON object with the following keys. Your entire response must be ONLY the JSON object:
+
+1. "type": Identify if the target is "overall" (entire product) or "component" (specific part).
+2. "label": The specific name of the target. Use "overall" or a specific noun (e.g., "handle", "履带", "底座").
+3. "User Speaking": Transcribe the user's exact words from the transcript.
+4. "Behavior description": A single, concise sentence describing what the user is doing (e.g., "The designer is describing the overall design concept of a night-time patrol robot").
+5. "User intent": Classify the intent into EXACTLY one of the following strings:
+    - "Appearance design": Related to visual form, proportions, materials, or surface details.
+    - "Functional concept": Related to functional objectives or improving features.
+    - "Structural design": Related to component relationships, layout, or adjustments.
+    - "Still-uncertain Idea Exploration": Exploratory attempts or undecided design thoughts.
+    - "Design Background supplement": Information related to goals, target users, or scenarios.
+
+Only output the JSON object, no other text.
+'''
+
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=[prompt]
+    )
+
+    return response.text
+
+
 # ========== 统一输入接口 ==========
 
 TriggerMode = Literal[0, 1, 2]
@@ -204,7 +322,11 @@ TriggerMode = Literal[0, 1, 2]
 
 MicMode = Literal[0, 1]
 # mico=0: 麦克风关闭，语音用于触发VLM分析（自言自语）
+#         - 实时语音识别持续运行
+#         - 检测到有语音内容时自动触发VLM分析
 # mico=1: 麦克风开启，语音用于LLM问答
+#         - 实时语音识别持续运行，文本累积
+#         - 用户切换到mico=0时，文本传给LLM问答
 
 
 def process_user_input(
@@ -212,10 +334,13 @@ def process_user_input(
     mico: MicMode = 0,
     image_bytes: str = None,
     virtual_json: dict = None,
-    record_duration: float = 5.0
+    trigger_types: list[PhysicalTriggerType] = None
 ) -> str:
     """
     统一输入接口：根据 t 和 mico 值决定处理方式。
+
+    注意：此函数不再自动录音，语音识别通过 speech.py 持续运行。
+    调用此函数时，语音文本已经通过 speech.py 的管理器累积。
 
     Args:
         t: 触发模式
@@ -223,37 +348,50 @@ def process_user_input(
             - 1: 部件生成（虚拟触发，需要 virtual_json）
             - 2: 整体生成（虚拟触发，需要 virtual_json）
         mico: 麦克风模式
-            - 0: 麦克风关闭，语音用于触发VLM分析
-            - 1: 麦克风开启，语音用于LLM问答
+            - 0: 自言自语模式，语音用于触发VLM分析
+            - 1: 问答模式，语音用于LLM问答（需要用户切换到mico=0后处理）
         image_bytes: Base64编码的图像（t=0 时必需）
         virtual_json: 虚拟界面操作数据（t=1或2 时必需）
-        record_duration: 录音时长（秒）
+        trigger_types: 物理世界触发类型列表（t=0时使用）
 
     Returns:
-        JSON字符串，包含分析结果
+        JSON字符串，包含分析结果或LLM回答
     """
-    from speech import get_transcript_from_mic
+    from speech import get_accumulated_text, has_speech_text
 
-    # 录音获取文本
-    print(f"[Input] Mode t={t}, mico={mico}, Recording for {record_duration} seconds...")
-    transcript_text = get_transcript_from_mic(record_duration)
+    # 获取当前累积的语音文本
+    transcript_text = get_accumulated_text()
+    print(f"[Input] Mode t={t}, mico={mico}")
     print(f"[Input] Transcript: '{transcript_text}'")
 
     # 根据 mico 值决定处理方式
     if mico == 1:
-        # 麦克风开启：语音用于LLM问答
-        return process_user_question(transcript_text)
+        # mico=1: 问答模式
+        # 语音累积中，等待用户切换到 mico=0 后处理
+        # 此函数调用时如果 mico=1，说明用户还没切换
+        print("[Input] mico=1: 语音累积中，等待用户切换到 mico=0 后处理问答")
+        return ""
 
     else:
-        # mico=0：麦克风关闭，语音用于触发VLM分析
+        # mico=0: 自言自语模式
+        # 检查是否有语音内容，有则触发相应处理
+
         if t == 0:
             # 物理世界触发
             if image_bytes is None:
                 print("[Input] Error: image_bytes required for t=0")
                 return ""
 
-            trigger_types = ["语音输入触发"]
-            return vlm_chat_mock(image_bytes, trigger_types, transcript_text)
+            # 如果有语音内容，触发VLM分析
+            if has_speech_text():
+                print("[Input] 检测到语音内容，触发VLM分析")
+                # 使用传入的 trigger_types 或默认值
+                if trigger_types is None:
+                    trigger_types = ["语音输入触发"]
+                return vlm_chat_mock(image_bytes, trigger_types, transcript_text)
+            else:
+                print("[Input] 无语音内容，不触发VLM分析")
+                return ""
 
         elif t == 1:
             # 部件生成（虚拟触发）
@@ -262,7 +400,12 @@ def process_user_input(
                 return ""
 
             trigger_type = "部件生成语音触发"
-            return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+            if has_speech_text():
+                print("[Input] 检测到语音内容，触发部件生成VLM分析")
+                return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+            else:
+                print("[Input] 无语音内容，不触发VLM分析")
+                return ""
 
         elif t == 2:
             # 整体生成（虚拟触发）
@@ -271,11 +414,53 @@ def process_user_input(
                 return ""
 
             trigger_type = "整体生成语音触发"
-            return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+            if has_speech_text():
+                print("[Input] 检测到语音内容，触发整体生成VLM分析")
+                return vlm_chat_virtual(virtual_json, trigger_type, transcript_text)
+            else:
+                print("[Input] 无语音内容，不触发VLM分析")
+                return ""
 
         else:
             print(f"[Input] Error: Invalid t value: {t}")
             return ""
+
+
+def handle_mode_switch_to_mico0(
+    previous_mico: MicMode = 1
+) -> str:
+    """
+    处理从 mico=1 切换到 mico=0 的逻辑。
+
+    当用户从问答模式切换回自言自语模式时：
+    - 获取累积的语音文本
+    - 传给LLM进行问答
+    - 清空累积文本，准备新一轮累积
+
+    Args:
+        previous_mico: 之前的模式（应该是1，表示从问答模式切换）
+
+    Returns:
+        LLM的回答内容
+    """
+    from speech import get_text_and_clear
+
+    if previous_mico != 1:
+        print("[Mode Switch] Error: previous_mico should be 1")
+        return ""
+
+    # 获取累积文本并清空
+    transcript_text = get_text_and_clear()
+    print(f"[Mode Switch] 从 mico=1 切换到 mico=0")
+    print(f"[Mode Switch] 累积语音文本: '{transcript_text}'")
+
+    if not transcript_text:
+        print("[Mode Switch] 无累积语音文本，不触发LLM问答")
+        return ""
+
+    # 调用LLM问答
+    print("[Mode Switch] 触发LLM问答")
+    return process_user_question(transcript_text)
 
 
 def process_user_question(question: str) -> str:
@@ -356,8 +541,13 @@ def load_memory_from_json(path: str) -> dict:
     """从JSON文件加载记忆数据库"""
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
-            print(f"[load_memory] Loading from '{path}'...")
-            return json.load(f)
+            content = f.read()
+            if content.strip():  # 文件有内容
+                print(f"[load_memory] Loading from '{path}'...")
+                return json.loads(content)
+            else:  # 文件为空
+                print(f"[load_memory] File '{path}' is empty, starting fresh.")
+                return {}
     print(f"[load_memory] No file at '{path}', starting empty.")
     return {}
 
@@ -365,7 +555,7 @@ def load_memory_from_json(path: str) -> dict:
 def save_memory_to_json(memory_db: dict, path: str):
     """保存记忆数据库到JSON文件"""
     with open(path, 'w', encoding='utf-8') as f:
-        json.dump(memory_db, f, indent=2, default=str)
+        json.dump(memory_db, f, indent=2, default=str, ensure_ascii=False)
     print(f"[save_memory] Saved to '{path}', total: {len(memory_db)} records")
 
 
