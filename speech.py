@@ -3,6 +3,12 @@ speech.py - 实时语音转写（科大讯飞RTASR）
 支持两种模式：
 - mico=0：分贝检测模式，自动触发回调
 - mico=1：持续发送模式，手动获取文本
+
+文件夹说明（供参考）：
+├── original_image/      → 原始参考图（永久保留，用于图像生成参考）
+├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
+├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── processed_images/    → 已存记忆的图片（永久保留）
 """
 
 import sys

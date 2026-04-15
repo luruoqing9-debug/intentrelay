@@ -2,6 +2,17 @@
 Memory.py - 记忆节点与管理模块
 包含：节点类定义、记忆管理逻辑
 依赖：record.py（编码、VLM、存储函数）
+
+文件夹说明：
+├── original_image/      → 原始参考图（永久保留，用于图像生成参考）
+├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
+├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── processed_images/    → 已存记忆的图片（永久保留）
+
+图片存储说明：
+- component_image 和 overall_image 来自 generated_images（图像生成后的结果）
+- 存入记忆后，图片移动到 processed_images 文件夹
+- Operated_image 的图片用于 VLM 分析，不存入记忆
 """
 
 import sys

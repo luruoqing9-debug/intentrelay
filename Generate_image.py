@@ -2,6 +2,24 @@
 Generate_image.py - ComfyUI API 图片生成模块
 调用 Gemini API (gemini-2.5-flash-image) 实现图片生成
 支持两种模式：单图生成（部件）和多图生成（整体）
+
+文件夹说明：
+├── original_image/      → 参考图（始终只有一张，上传新图时自动替换旧的）
+│                          部件生成：部件参考图
+│                          整体生成：粗糙结构参考图（添加到图片数组末尾）
+├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
+├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── processed_images/    → 已存记忆的图片（永久保留）
+
+使用流程：
+1. 前端上传参考图到 original_image/（调用 /upload_reference_image）
+2. 系统自动从 original_image/ 读取参考图进行生成
+3. 生成的图片输出到 generated_images/ 文件夹
+4. 存入记忆后，图片移动到 processed_images/ 文件夹
+
+关键函数：
+- get_original_image(): 获取 original_image/ 中的唯一图片
+- update_original_image(new_path): 更新 original_image/ 中的图片（删除旧的）
 """
 
 import sys
@@ -12,6 +30,7 @@ import uuid
 import base64
 import requests
 import websocket
+import shutil
 from typing import Literal, Optional, List, Dict, Union
 from pathlib import Path
 
@@ -29,6 +48,130 @@ from generate import (
 
 
 # ========== 图片文件夹处理 ==========
+
+# original_image 文件夹路径
+ORIGINAL_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "original_image")
+# processed_images 文件夹路径
+PROCESSED_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "processed_images")
+
+
+def get_original_image() -> str:
+    """
+    从 original_image/ 文件夹获取唯一的参考图片
+
+    该文件夹始终只有一张图片（用户放入新图片时会替换旧的）
+
+    Returns:
+        图片路径（如果文件夹为空返回 None）
+    """
+    supported_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']
+
+    if not os.path.exists(ORIGINAL_IMAGE_DIR):
+        os.makedirs(ORIGINAL_IMAGE_DIR)
+        print(f"[original_image] Created folder: {ORIGINAL_IMAGE_DIR}")
+        return None
+
+    # 获取所有图片文件
+    image_files = []
+    for f in os.listdir(ORIGINAL_IMAGE_DIR):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in supported_extensions:
+            image_files.append(os.path.join(ORIGINAL_IMAGE_DIR, f))
+
+    if len(image_files) == 0:
+        print(f"[original_image] No image found in folder")
+        return None
+
+    # 返回找到的第一张图片（文件夹中应该只有一张）
+    image_path = image_files[0]
+    print(f"[original_image] Found reference image: {image_path}")
+    return image_path
+
+
+def get_processed_component_images(exclude_overall: bool = True) -> List[str]:
+    """
+    从 processed_images/ 文件夹获取所有部件图片（排除 overall.png）
+
+    用于整体生成时自动读取所有已生成的部件图片
+
+    Args:
+        exclude_overall: 是否排除 overall.png（默认 True）
+
+    Returns:
+        部件图片路径列表（按文件名排序）
+    """
+    supported_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']
+    excluded_names = ['overall.png', 'overall.jpg', 'overall.jpeg', 'overall.bmp', 'overall.gif', 'overall.webp']
+
+    if not os.path.exists(PROCESSED_IMAGES_DIR):
+        os.makedirs(PROCESSED_IMAGES_DIR)
+        print(f"[processed_images] Created folder: {PROCESSED_IMAGES_DIR}")
+        return []
+
+    # 获取所有图片文件
+    image_files = []
+    for f in os.listdir(PROCESSED_IMAGES_DIR):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in supported_extensions:
+            # 排除 overall 图片
+            if exclude_overall and f.lower() in [name.lower() for name in excluded_names]:
+                continue
+            image_files.append(os.path.join(PROCESSED_IMAGES_DIR, f))
+
+    # 按文件名排序
+    image_files.sort()
+
+    print(f"[processed_images] Found {len(image_files)} component images")
+    for i, path in enumerate(image_files):
+        print(f"  [{i}] {os.path.basename(path)}")
+
+    return image_files
+
+
+def update_original_image(new_image_path: str) -> str:
+    """
+    更新 original_image/ 文件夹中的图片（删除旧的，放入新的）
+
+    Args:
+        new_image_path: 新图片的路径（前端上传的临时路径或外部路径）
+
+    Returns:
+        新图片在 original_image/ 中的最终路径
+    """
+    supported_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']
+
+    # 确保文件夹存在
+    if not os.path.exists(ORIGINAL_IMAGE_DIR):
+        os.makedirs(ORIGINAL_IMAGE_DIR)
+
+    # 删除文件夹中所有现有图片
+    deleted_count = 0
+    for f in os.listdir(ORIGINAL_IMAGE_DIR):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in supported_extensions:
+            old_path = os.path.join(ORIGINAL_IMAGE_DIR, f)
+            try:
+                os.remove(old_path)
+                deleted_count += 1
+                print(f"[original_image] Deleted old image: {old_path}")
+            except Exception as e:
+                print(f"[original_image] Failed to delete {old_path}: {e}")
+
+    # 获取新图片的文件名和扩展名
+    new_filename = os.path.basename(new_image_path)
+    new_ext = os.path.splitext(new_filename)[1].lower()
+
+    # 如果不是图片格式，报错
+    if new_ext not in supported_extensions:
+        raise ValueError(f"Unsupported image format: {new_ext}")
+
+    # 复制新图片到 original_image/
+    final_path = os.path.join(ORIGINAL_IMAGE_DIR, new_filename)
+    shutil.copy(new_image_path, final_path)
+    print(f"[original_image] Added new image: {final_path} (deleted {deleted_count} old images)")
+
+    return final_path
+
 
 def get_images_from_folder(folder_path: str, max_images: int = 9) -> List[str]:
     """

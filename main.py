@@ -1,6 +1,12 @@
 """
 main.py - IntentRelay 后台服务入口
 
+文件夹说明：
+├── original_image/      → 原始参考图（永久保留，用于图像生成参考）
+├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
+├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── processed_images/    → 已存记忆的图片（永久保留）
+
 系统角色：
     main.py 作为后台服务，提供处理函数供外部系统调用。
     mico 状态切换由外部系统管理，main.py 不主动改变状态。
@@ -13,11 +19,16 @@ main.py - IntentRelay 后台服务入口
     5. 系统清理
 
 图像分析流程：
-    - Operated_image 文件夹存储视频帧（001.png, 002.png, ...）
+    - Operated_image 文件夹存储视频帧（眼动追踪/摄像头捕获）
     - 触发发生时，外部系统调用 handle_vlm_analysis()
     - main.py 读取 Operated_image 中所有图像
     - 进行多图像 VLM 分析
-    - 分析完成后清空 Operated_image
+    - 分析完成后清空 Operated_image（不存入记忆）
+
+图像生成流程：
+    - 参考图片来自 original_image 文件夹
+    - 生成的图片输出到 generated_images 文件夹
+    - 存入记忆后，图片移动到 processed_images 文件夹
 
 外部系统调用方式：
     - handle_vlm_analysis()      → VLM 分析 + 存入记忆
@@ -100,7 +111,7 @@ from Feedback import (
 # 生成模块
 from generate import (
     process_generate_request,
-    get_components_info
+    get_components_info as get_components_info_from_generate
 )
 
 # 图片生成模块
@@ -169,8 +180,9 @@ def handle_vlm_analysis_with_text(trigger_types: list, transcript_text: str) -> 
         "vlm_result": None,
         "node": None,
         "node_type": None,
-        "feedback": None,
-        "repeat_count": 0
+        "repeat_count": 0,
+        "should_feedback": False,
+        "parsed_vlm": None
     }
 
     print("\n" + "="*50)
@@ -250,13 +262,14 @@ def handle_vlm_analysis_with_text(trigger_types: list, transcript_text: str) -> 
     # 5. 存入记忆
     print("\n[Step 5] 存入记忆...")
     try:
-        # 有图像则使用第一张，否则不传图像
-        first_image = images[0][0] if len(images) > 0 else None
+        # 注意：Operated_image 的图像只是用于 VLM 分析用户意图
+        # 不存入记忆，因为 component_image/overall_image 应该是图像生成后的结果
+        # （存放在 generated_images 文件夹）
 
         node, node_type = process_vlm_result(
             vlm_result=vlm_json,
             memory_db=memory_db,
-            component_image=first_image
+            component_image=None  # 不存 Operated_image 的图片
         )
 
         if node:
@@ -271,20 +284,18 @@ def handle_vlm_analysis_with_text(trigger_types: list, transcript_text: str) -> 
     except Exception as e:
         print(f"[记忆] 存储异常: {e}")
 
-    # 6. 重复检测 + AI反馈
+    # 6. 重复检测（返回状态，不自动生成反馈）
     print("\n[Step 6] 重复检测...")
     try:
         parsed, should_feedback, count = check_vlm_output(vlm_response, trigger_types[0])
         result["repeat_count"] = count
+        result["should_feedback"] = should_feedback
+        result["parsed_vlm"] = parsed  # 返回解析后的结果，供前端调用 ai_feedback 时使用
         print(f"  ✓ 重复计数: {count}")
+        print(f"  ✓ 是否需要反馈: {should_feedback}")
 
-        if should_feedback:
-            print(f"  ⚠ 重复超过阈值，生成 AI 反馈...")
-            component_name = vlm_json.get("label", "unknown")
-            feedback = generate_ai_feedback(component_name, parsed, memory_db)
-            result["feedback"] = feedback
-            print(f"  ✓ AI 建议:")
-            print(f"    {feedback.get('content', '')[:200]}{'...' if len(feedback.get('content', '')) > 200 else ''}")
+        # 不自动生成 AI 反馈，让前端决定是否需要
+        # 如果前端需要，可以调用独立的 ai_feedback 接口
 
     except Exception as e:
         print(f"[反馈] 检测异常: {e}")
@@ -370,7 +381,11 @@ def init_system() -> bool:
     print("\n[Step 2] 加载记忆数据库...")
 
     memory_path = os.path.join(PROJECT_DIR, "object_nodes.json")
-    memory_db = load_memory_from_json(memory_path)
+    loaded_memory = load_memory_from_json(memory_path)
+
+    # 使用 clear + update 而不是重新赋值，确保导入的引用也能更新
+    memory_db.clear()
+    memory_db.update(loaded_memory)
 
     component_count = sum(1 for d in memory_db.values() if d.get('node_type') == 'COMPONENT')
     overall_count = sum(1 for d in memory_db.values() if d.get('node_type') == 'OVERALL')
@@ -545,8 +560,9 @@ def handle_vlm_analysis(trigger_types: list = None) -> dict:
         "vlm_result": None,
         "node": None,
         "node_type": None,
-        "feedback": None,
-        "repeat_count": 0
+        "repeat_count": 0,
+        "should_feedback": False,
+        "parsed_vlm": None
     }
 
     # 设置默认触发类型
@@ -625,13 +641,14 @@ def handle_vlm_analysis(trigger_types: list = None) -> dict:
     # 6. 存入记忆
     print("\n[Step 6] 存入记忆...")
     try:
-        # 使用第一张图像作为代表图像存储
-        first_image = images[0][0]
+        # 注意：Operated_image 的图像只是用于 VLM 分析用户意图
+        # 不存入记忆，因为 component_image/overall_image 应该是图像生成后的结果
+        # （存放在 generated_images 文件夹）
 
         node, node_type = process_vlm_result(
             vlm_result=vlm_json,
             memory_db=memory_db,
-            component_image=first_image
+            component_image=None  # 不存 Operated_image 的图片
         )
 
         if node:
@@ -647,20 +664,18 @@ def handle_vlm_analysis(trigger_types: list = None) -> dict:
     except Exception as e:
         print(f"[记忆] 存储异常: {e}")
 
-    # 7. 重复检测 + AI反馈
+    # 7. 重复检测（返回状态，不自动生成反馈）
     print("\n[Step 7] 重复检测...")
     try:
         parsed, should_feedback, count = check_vlm_output(vlm_response, trigger_types[0])
         result["repeat_count"] = count
+        result["should_feedback"] = should_feedback
+        result["parsed_vlm"] = parsed  # 返回解析后的结果，供前端调用 ai_feedback 时使用
         print(f"  ✓ 重复计数: {count}")
+        print(f"  ✓ 是否需要反馈: {should_feedback}")
 
-        if should_feedback:
-            print(f"  ⚠ 重复超过阈值，生成 AI 反馈...")
-            component_name = vlm_json.get("label", "unknown")
-            feedback = generate_ai_feedback(component_name, parsed, memory_db)
-            result["feedback"] = feedback
-            print(f"  ✓ AI 建议:")
-            print(f"    {feedback.get('content', '')[:200]}{'...' if len(feedback.get('content', '')) > 200 else ''}")
+        # 不自动生成 AI 反馈，让前端决定是否需要
+        # 如果前端需要，可以调用独立的 ai_feedback 接口
 
     except Exception as e:
         print(f"[反馈] 检测异常: {e}")
@@ -902,7 +917,7 @@ def get_components_info() -> dict:
     """
     global memory_db
 
-    return get_components_info(trigger=1, memory_db=memory_db)
+    return get_components_info_from_generate(trigger=1, memory_db=memory_db)
 
 
 # ==================== 辅助函数 ====================

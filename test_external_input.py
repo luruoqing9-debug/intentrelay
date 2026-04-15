@@ -1,6 +1,12 @@
 """
 test_external_input.py - 模拟外部输入测试
 
+文件夹说明：
+├── original_image/      → 原始参考图（永久保留，用于图像生成参考）
+├── Operated_image/      → 操作记录图（临时，VLM分析后清空）
+├── generated_images/    → 生成的图片（临时，存入记忆后移动到 processed_images）
+├── processed_images/    → 已存记忆的图片（永久保留）
+
 测试 main.py 提供的对外接口，无需启动完整系统。
 """
 
