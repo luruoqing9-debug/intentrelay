@@ -559,6 +559,9 @@ def process_user_feedback(user_feedback: str) -> dict:
             model='gemini-2.5-flash',
             contents=[analyze_prompt]
         )
+        # 调试：打印 LLM 原始返回
+        print(f"[User Feedback] LLM raw response: {response.text[:200] if response.text else 'Empty'}...")
+
         result = extract_and_parse_json(response.text)
 
         if result is None:
@@ -619,3 +622,681 @@ def reset_weights():
         "Context-specific": 1.0
     }
     print("[User Feedback] Weights reset to default")
+
+
+# ========== 记忆问答交互 ==========
+
+# 全局状态：当前问题列表和正在回答的问题索引
+_question_list = []
+_current_question_index = 0
+
+
+def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
+    """
+    多轮问答：AI生成最多3个问题，逐个询问用户。
+
+    用户只需要输入回答内容，不需要输入部件名和描述类型！
+    AI 会记住当前正在问哪个问题，自动匹配用户的回答。
+
+    询问两类问题：
+    1. 完全没有描述但重要：某个部件的某个维度是空的
+    2. 描述冲突：同一部件的不同描述矛盾
+
+    不询问 status=0 的内容（用户正在探索的）。
+
+    Args:
+        memory_db: 记忆数据库
+        user_answer: 用户对当前问题的回答（纯文本，如 "科技风格，金属材质")
+            如果为 None，表示开始新一轮问答，AI会生成问题列表
+
+    Returns:
+        dict: {
+            "has_question": true/false,
+            "questions": [
+                {
+                    "target": "履带",
+                    "desc_type": "外形",
+                    "issue_type": "缺失",
+                    "question": "履带的外形风格您希望是什么？"
+                },
+                ...最多3个
+            ],
+            "current_index": 0,  // 当前正在问第几个问题
+            "update_result": "已更新" 或 null,
+            "remaining_count": 2  // 剩余多少问题没问
+        }
+    """
+    global _question_list, _current_question_index
+    print("\n[Memory QA] 开始问答轮次...")
+
+    # 1. 如果有用户回答，先更新记忆
+    update_result = None
+    if user_answer and user_answer.strip() and _question_list and _current_question_index < len(_question_list):
+        current_question = _question_list[_current_question_index]
+        target = current_question.get("target")
+        desc_type = current_question.get("desc_type")
+
+        # 特殊处理：SKIP 表示跳过当前问题
+        if user_answer.strip() == "SKIP":
+            print(f"[Memory QA] 用户跳过问题[{_current_question_index}]: target='{target}', desc_type='{desc_type}'")
+            update_result = f"已跳过 {target} 的 {desc_type} 问题"
+            _current_question_index += 1
+            print(f"[Memory QA] 移到下一个问题，当前索引: {_current_question_index}")
+        else:
+            print(f"[Memory QA] 用户回答: '{user_answer}'")
+            print(f"[Memory QA] 当前问题[{_current_question_index}]: target='{target}', desc_type='{desc_type}'")
+
+            # 导入更新函数
+            from Memory import add_description_from_answer
+            success, message = add_description_from_answer(
+                memory_db=memory_db,
+                target_name=target,
+                desc_type=desc_type,
+                answer=user_answer.strip()
+            )
+            update_result = message if success else f"更新失败: {message}"
+            print(f"[Memory QA] 更新记忆: {message}")
+
+            # 移到下一个问题
+            _current_question_index += 1
+            print(f"[Memory QA] 移到下一个问题，当前索引: {_current_question_index}")
+
+    elif user_answer and user_answer.strip() and (not _question_list or _current_question_index >= len(_question_list)):
+        print("[Memory QA] 收到回答但没有待回答的问题")
+        update_result = "没有待回答的问题，请先开始新一轮问答"
+        # 重置状态
+        _question_list = []
+        _current_question_index = 0
+
+    # 2. 判断当前状态
+    # 如果问题列表不为空，且索引在范围内，返回当前问题
+    if _question_list and _current_question_index < len(_question_list):
+        remaining_count = len(_question_list) - _current_question_index
+        current_question = _question_list[_current_question_index]
+
+        print(f"[Memory QA] 当前问题[{_current_question_index}]: {current_question}")
+        print(f"[Memory QA] 剩余 {remaining_count} 个问题")
+
+        return {
+            "has_questions": True,
+            "questions": _question_list,
+            "current_index": _current_question_index,
+            "current_question": current_question,
+            "update_result": update_result,
+            "remaining_count": remaining_count
+        }
+
+    # 3. 如果问题列表不为空，但索引超出了，说明这轮问答结束
+    # 不自动生成新问题，等待用户主动开始新一轮
+    if _question_list and _current_question_index >= len(_question_list):
+        print("[Memory QA] 这轮问答结束，清空问题列表")
+        _question_list = []
+        _current_question_index = 0
+
+        return {
+            "has_questions": False,
+            "questions": [],
+            "current_index": 0,
+            "current_question": None,
+            "update_result": update_result,
+            "remaining_count": 0
+        }
+
+    # 4. 如果问题列表为空，且没有用户回答（新一轮开始），生成问题列表
+    if not _question_list and not user_answer:
+        # 提取当前记忆状态
+        components_data = {}
+        overall_data = {}
+
+        for node_id, data in memory_db.items():
+            if data.get('node_type') == 'COMPONENT':
+                component_name = data.get('component_name', '未知部件')
+
+                # 确定的描述 (status=1)
+                appearance_confirmed = [d.get('content', '') for d in data.get('appearance_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+                function_confirmed = [d.get('content', '') for d in data.get('function_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+                structure_confirmed = [d.get('content', '') for d in data.get('structure_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+
+                # 探索中的描述 (status=0) - 不询问
+                appearance_exploring = [d.get('content', '') for d in data.get('appearance_descriptions', []) if d.get('status', 1) == 0 and d.get('content', '')]
+                function_exploring = [d.get('content', '') for d in data.get('function_descriptions', []) if d.get('status', 1) == 0 and d.get('content', '')]
+                structure_exploring = [d.get('content', '') for d in data.get('structure_descriptions', []) if d.get('status', 1) == 0 and d.get('content', '')]
+
+                components_data[component_name] = {
+                    "appearance_confirmed": appearance_confirmed,
+                    "function_confirmed": function_confirmed,
+                    "structure_confirmed": structure_confirmed,
+                    "appearance_exploring": appearance_exploring,
+                    "function_exploring": function_exploring,
+                    "structure_exploring": structure_exploring
+                }
+
+            elif data.get('node_type') == 'OVERALL':
+                design_background = data.get('design_background', '')
+
+                overall_appearances_confirmed = [d.get('content', '') for d in data.get('overall_appearances', []) if d.get('status', 1) == 1 and d.get('content', '')]
+                overall_functions_confirmed = [d.get('content', '') for d in data.get('overall_functions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+                overall_structures_confirmed = [d.get('content', '') for d in data.get('overall_structures', []) if d.get('status', 1) == 1 and d.get('content', '')]
+
+                overall_data = {
+                    "design_background": design_background,
+                    "appearance_confirmed": overall_appearances_confirmed,
+                    "function_confirmed": overall_functions_confirmed,
+                    "structure_confirmed": overall_structures_confirmed
+                }
+
+        # 构建记忆摘要
+        memory_summary = "当前记忆内容：\n"
+
+        if overall_data:
+            memory_summary += "\n【整体】\n"
+            memory_summary += f"  设计背景：{overall_data['design_background'] if overall_data['design_background'] else '暂无'}\n"
+            memory_summary += f"  外形（已确定）：{', '.join(overall_data['appearance_confirmed']) if overall_data['appearance_confirmed'] else '暂无'}\n"
+            memory_summary += f"  功能（已确定）：{', '.join(overall_data['function_confirmed']) if overall_data['function_confirmed'] else '暂无'}\n"
+            memory_summary += f"  结构（已确定）：{', '.join(overall_data['structure_confirmed']) if overall_data['structure_confirmed'] else '暂无'}\n"
+
+        if components_data:
+            memory_summary += "\n【部件】\n"
+            for name, info in components_data.items():
+                memory_summary += f"  {name}：\n"
+                memory_summary += f"    外形（已确定）：{', '.join(info['appearance_confirmed']) if info['appearance_confirmed'] else '暂无'}\n"
+                memory_summary += f"    功能（已确定）：{', '.join(info['function_confirmed']) if info['function_confirmed'] else '暂无'}\n"
+                memory_summary += f"    结构（已确定）：{', '.join(info['structure_confirmed']) if info['structure_confirmed'] else '暂无'}\n"
+
+        print(f"[Memory QA] 提取到 {len(components_data)} 个部件")
+
+        # 使用 LLM 分析并生成问题列表（最多3个）
+        analyze_prompt = f'''
+你是一个产品设计助手。请分析当前记忆内容，找出需要询问用户的问题。
+
+## 当前记忆内容
+{memory_summary}
+
+## 你需要找的问题类型（只找这两类）
+
+### 类型1：完全没有描述但重要
+某个部件或整体的某个维度**完全没有任何已确定的描述**（列表是空的），但这对设计很重要。
+
+例如：
+- 履带的外形（已确定）是"暂无" → 需要问：履带的外形风格您希望是什么？
+- 整体的设计背景是"暂无" → 需要问：这个产品的目标用户和使用场景是什么？
+
+### 类型2：描述冲突
+同一部件的不同已确定描述之间可能存在矛盾。
+
+例如：
+- 履带外形说"轻便小巧"，但结构说"笨重的大型框架" → 冲突！需要问用户确认
+
+## 不要询问的内容
+
+- **正在探索中的内容（status=0）**：这些是用户正在思考的，不要打断！
+- 已有确定描述的维度：不需要重复询问
+
+## 你的任务
+
+1. 找出所有符合上述两类问题的情况
+2. 按重要性排序（设计背景 > 部件外形 > 部件功能 > 部件结构 > 冲突）
+3. 返回**最多3个**最重要的问题
+4. 如果没有需要询问的问题，返回 has_questions=false
+
+## 输出格式（严格遵守JSON格式）
+ {{
+    "has_questions": true或false,
+    "questions": [
+        {{
+            "target": "部件名或整体",
+            "desc_type": "外形/功能/结构/背景",
+            "issue_type": "缺失/冲突",
+            "issue": "简述缺失什么或有什么冲突",
+            "question": "向用户提出的问题（简洁明确，一句话）"
+        }},
+        ...最多3个
+    ],
+    "total_count": 总问题数量（0-3的整数）
+}}
+
+如果 has_questions=false，questions 字段为空列表。
+'''
+
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[analyze_prompt]
+            )
+            result = extract_and_parse_json(response.text)
+
+            if result is None:
+                print("[Memory QA] LLM 解析失败")
+                return {
+                    "has_questions": False,
+                    "questions": [],
+                    "current_index": 0,
+                    "update_result": update_result,
+                    "remaining_count": 0
+                }
+
+            # 更新全局状态
+            _question_list = result.get("questions", [])
+            _current_question_index = 0
+            total_count = len(_question_list)
+
+            print(f"[Memory QA] 生成了 {total_count} 个问题")
+            for i, q in enumerate(_question_list):
+                print(f"  [{i}] {q.get('target')} - {q.get('desc_type')}: {q.get('question')}")
+
+            return {
+                "has_questions": result.get("has_questions", False) and total_count > 0,
+                "questions": _question_list,
+                "current_index": _current_question_index,
+                "update_result": update_result,
+                "remaining_count": total_count
+            }
+
+        except Exception as e:
+            print(f"[Memory QA] 异常: {e}")
+            return {
+                "has_questions": False,
+                "questions": [],
+                "current_index": 0,
+                "update_result": update_result,
+                "remaining_count": 0,
+                "error": str(e)
+            }
+
+    # 3. 如果还有未问完的问题，返回当前问题
+    else:
+        remaining_count = len(_question_list) - _current_question_index
+        current_question = _question_list[_current_question_index] if _current_question_index < len(_question_list) else None
+
+        print(f"[Memory QA] 当前问题[{_current_question_index}]: {current_question}")
+        print(f"[Memory QA] 剩余 {remaining_count} 个问题")
+
+        return {
+            "has_questions": remaining_count > 0,
+            "questions": _question_list,
+            "current_index": _current_question_index,
+            "current_question": current_question,  # 当前正在问的问题
+            "update_result": update_result,
+            "remaining_count": remaining_count
+        }
+
+
+# ========== 旧版批量分析（保留备用） ==========
+
+def analyze_memory_and_generate_questions(memory_db: dict) -> dict:
+    """
+    整理记忆中所有文字信息，找出缺失或冲突的地方，生成问题询问用户。
+
+    注意：status=0 的内容是用户正在探索的，不需要询问。
+    此函数只关注重要信息缺失或描述冲突的情况。
+
+    Args:
+        memory_db: 记忆数据库
+
+    Returns:
+        dict: {
+            "has_issues": true/false,
+            "questions": [
+                {
+                    "id": 1,
+                    "target": "履带",
+                    "type": "缺失/冲突",
+                    "issue_description": "外形描述缺失",
+                    "question": "履带的外形风格您希望是什么？"
+                },
+                ...
+            ],
+            "memory_summary": "当前有2个部件..."
+        }
+    """
+    print("\n[Memory Analysis] 开始整理记忆...")
+
+    # 1. 提取所有部件信息（只提取 status=1 的确定内容）
+    components_data = {}
+    overall_data = {}
+
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            component_name = data.get('component_name', '未知部件')
+
+            # 只提取确定的描述 (status=1)
+            appearance_list = [d.get('content', '') for d in data.get('appearance_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+            function_list = [d.get('content', '') for d in data.get('function_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+            structure_list = [d.get('content', '') for d in data.get('structure_descriptions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+
+            components_data[component_name] = {
+                "appearance": appearance_list,
+                "function": function_list,
+                "structure": structure_list
+            }
+
+        elif data.get('node_type') == 'OVERALL':
+            design_background = data.get('design_background', '')
+
+            # 只提取确定的描述 (status=1)
+            overall_appearances = [d.get('content', '') for d in data.get('overall_appearances', []) if d.get('status', 1) == 1 and d.get('content', '')]
+            overall_functions = [d.get('content', '') for d in data.get('overall_functions', []) if d.get('status', 1) == 1 and d.get('content', '')]
+            overall_structures = [d.get('content', '') for d in data.get('overall_structures', []) if d.get('status', 1) == 1 and d.get('content', '')]
+
+            overall_data = {
+                "design_background": design_background,
+                "appearance": overall_appearances,
+                "function": overall_functions,
+                "structure": overall_structures
+            }
+
+    # 2. 构建记忆摘要
+    memory_summary = "当前记忆内容（已确定的描述）：\n"
+
+    if overall_data:
+        memory_summary += "\n整体信息：\n"
+        if overall_data.get('design_background'):
+            memory_summary += f"  设计背景：{overall_data['design_background']}\n"
+        if overall_data.get('appearance'):
+            memory_summary += f"  外形：{', '.join(overall_data['appearance'])}\n"
+        if overall_data.get('function'):
+            memory_summary += f"  功能：{', '.join(overall_data['function'])}\n"
+        if overall_data.get('structure'):
+            memory_summary += f"  结构：{', '.join(overall_data['structure'])}\n"
+
+    if components_data:
+        memory_summary += "\n部件信息：\n"
+        for name, info in components_data.items():
+            memory_summary += f"  {name}：\n"
+            memory_summary += f"    外形：{', '.join(info['appearance']) if info['appearance'] else '暂无'}\n"
+            memory_summary += f"    功能：{', '.join(info['function']) if info['function'] else '暂无'}\n"
+            memory_summary += f"    结构：{', '.join(info['structure']) if info['structure'] else '暂无'}\n"
+
+    print(f"[Memory Analysis] 提取到 {len(components_data)} 个部件")
+    print(f"[Memory Analysis] 记忆摘要已生成")
+
+    # 3. 使用 LLM 分析缺失/冲突并生成问题
+    analyze_prompt = f'''
+你是一个产品设计助手，正在协助整理设计记忆。请分析以下记忆内容，找出需要用户补充的重要信息。
+
+## 当前记忆内容（用户已确定的描述）
+{memory_summary}
+
+## 你的任务
+分析每个部件和整体，找出以下问题：
+
+1. **重要信息缺失**：某个部件或整体缺少关键维度的描述
+   - 外形缺失：没有描述外形风格、材质、颜色等
+   - 功能缺失：没有描述主要功能、用途
+   - 结构缺失：没有描述结构关系、连接方式
+   - 设计背景缺失：整体没有设计背景（目标用户、使用场景）
+
+2. **描述冲突**：同一部件的不同描述可能存在矛盾
+   - 例如：外形说"轻便小巧"，但结构说"笨重的大型框架"
+
+3. 按重要性排序，生成不超过3条问题
+
+## 注意
+- status=0 的内容是用户正在探索的，不要作为问题来源
+- 只关注用户还没提到的、但对设计很重要的信息
+- 问题应该具体、简洁，用户可以直接回答
+
+## 输出格式（严格遵守JSON格式）
+ {{
+    "has_issues": true或false,
+    "questions": [
+        {{
+            "id": 1,
+            "target": "部件名或整体",
+            "type": "缺失/冲突",
+            "issue_description": "具体描述缺失什么或有什么冲突",
+            "question": "向用户提出的问题（简洁明确）"
+        }},
+        ...
+    ],
+    "analysis_summary": "简要分析结果"
+}}
+
+注意：
+- 如果记忆内容完整且无冲突，has_issues 设为 false，questions 为空列表
+- 问题数量不超过3条
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[analyze_prompt]
+        )
+        result = extract_and_parse_json(response.text)
+
+        if result is None:
+            print("[Memory Analysis] LLM 解析失败")
+            return {
+                "has_issues": False,
+                "questions": [],
+                "memory_summary": memory_summary
+            }
+
+        print(f"[Memory Analysis] LLM 分析完成，has_issues: {result.get('has_issues')}")
+        print(f"[Memory Analysis] 生成 {len(result.get('questions', []))} 条问题")
+
+        return {
+            "has_issues": result.get("has_issues", False),
+            "questions": result.get("questions", []),
+            "memory_summary": memory_summary,
+            "analysis_summary": result.get("analysis_summary", "")
+        }
+
+    except Exception as e:
+        print(f"[Memory Analysis] 异常: {e}")
+        return {
+            "has_issues": False,
+            "questions": [],
+            "memory_summary": memory_summary,
+            "error": str(e)
+        }
+
+
+# ========== 不确定内容建议生成 ==========
+
+def get_uncertain_suggestions(memory_db: dict) -> dict:
+    """
+    提取所有 status=0 的不确定内容，为每个生成简短建议。
+
+    Args:
+        memory_db: 记忆数据库
+
+    Returns:
+        dict: {
+            "has_uncertain": true/false,
+            "uncertain_items": [
+                {
+                    "id": 1,
+                    "target": "履带",
+                    "type": "外形",
+                    "content": "还没想好外形风格",
+                    "suggestion": "可考虑科技风格，与整体功能定位匹配"
+                },
+                ...
+            ],
+            "count": 3
+        }
+    """
+    print("\n[Uncertain Suggestions] 开始提取不确定内容...")
+
+    # 1. 提取所有 status=0 的内容
+    uncertain_items = []
+
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            component_name = data.get('component_name', '未知部件')
+
+            # 外形描述
+            for desc in data.get('appearance_descriptions', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": component_name,
+                        "type": "外形",
+                        "content": desc.get('content', '')
+                    })
+
+            # 功能描述
+            for desc in data.get('function_descriptions', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": component_name,
+                        "type": "功能",
+                        "content": desc.get('content', '')
+                    })
+
+            # 结构描述
+            for desc in data.get('structure_descriptions', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": component_name,
+                        "type": "结构",
+                        "content": desc.get('content', '')
+                    })
+
+        elif data.get('node_type') == 'OVERALL':
+            # 整体外形
+            for desc in data.get('overall_appearances', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": "整体",
+                        "type": "外形",
+                        "content": desc.get('content', '')
+                    })
+
+            # 整体功能
+            for desc in data.get('overall_functions', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": "整体",
+                        "type": "功能",
+                        "content": desc.get('content', '')
+                    })
+
+            # 整体结构
+            for desc in data.get('overall_structures', []):
+                if desc.get('status', 1) == 0 and desc.get('content', '').strip():
+                    uncertain_items.append({
+                        "target": "整体",
+                        "type": "结构",
+                        "content": desc.get('content', '')
+                    })
+
+    print(f"[Uncertain Suggestions] 提取到 {len(uncertain_items)} 条不确定内容")
+
+    if not uncertain_items:
+        return {
+            "has_uncertain": False,
+            "uncertain_items": [],
+            "count": 0
+        }
+
+    # 2. 提取已确定的上下文信息（用于生成建议参考）
+    context_info = []
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            name = data.get('component_name', '未知')
+            # 已确定的描述
+            for desc in data.get('appearance_descriptions', []):
+                if desc.get('status', 1) == 1 and desc.get('content', '').strip():
+                    context_info.append(f"[{name} 外形] {desc.get('content', '')}")
+            for desc in data.get('function_descriptions', []):
+                if desc.get('status', 1) == 1 and desc.get('content', '').strip():
+                    context_info.append(f"[{name} 功能] {desc.get('content', '')}")
+            for desc in data.get('structure_descriptions', []):
+                if desc.get('status', 1) == 1 and desc.get('content', '').strip():
+                    context_info.append(f"[{name} 结构] {desc.get('content', '')}")
+
+        elif data.get('node_type') == 'OVERALL':
+            if data.get('design_background'):
+                context_info.append(f"[整体背景] {data.get('design_background')}")
+
+    context_text = "\n".join(context_info) if context_info else "暂无其他参考信息"
+
+    # 3. 使用 LLM 为每条不确定内容生成简短建议
+    items_text = "\n".join([
+        f"{i+1}. [{item['target']} {item['type']}] {item['content']}"
+        for i, item in enumerate(uncertain_items)
+    ])
+
+    suggest_prompt = f'''
+你是一个产品设计助手。用户正在进行设计探索，有一些内容尚未确定。
+请根据已有的上下文信息，为每条不确定内容提供简短的建议方向。
+
+## 已确定的上下文信息
+{context_text}
+
+## 用户不确定的内容
+{items_text}
+
+## 任务
+为每条不确定内容生成一条简短建议（不超过30字）：
+- 建议应该具体、有启发性
+- 结合已有上下文信息
+- 不要给出最终答案，而是提供思考方向
+
+## 输出格式（严格遵守JSON格式）
+ {{
+    "suggestions": [
+        {{
+            "id": 1,
+            "target": "部件名",
+            "type": "外形/功能/结构",
+            "content": "不确定的内容",
+            "suggestion": "简短建议（不超过30字）"
+        }},
+        ...
+    ]
+}}
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[suggest_prompt]
+        )
+        result = extract_and_parse_json(response.text)
+
+        if result is None:
+            print("[Uncertain Suggestions] LLM 解析失败，使用默认建议")
+            # 使用默认建议
+            for i, item in enumerate(uncertain_items):
+                item['id'] = i + 1
+                item['suggestion'] = f"可以参考同类产品的{item['type']}设计"
+            return {
+                "has_uncertain": True,
+                "uncertain_items": uncertain_items,
+                "count": len(uncertain_items)
+            }
+
+        # 合并 LLM 结果
+        suggestions = result.get('suggestions', [])
+        for i, item in enumerate(uncertain_items):
+            item['id'] = i + 1
+            # 匹配 LLM 返回的建议
+            for sug in suggestions:
+                if sug.get('target') == item['target'] and sug.get('type') == item['type']:
+                    item['suggestion'] = sug.get('suggestion', '可以进一步思考')
+                    break
+            if 'suggestion' not in item:
+                item['suggestion'] = f"可以参考同类产品的{item['type']}设计"
+
+        print(f"[Uncertain Suggestions] 生成了 {len(uncertain_items)} 条建议")
+
+        return {
+            "has_uncertain": True,
+            "uncertain_items": uncertain_items,
+            "count": len(uncertain_items)
+        }
+
+    except Exception as e:
+        print(f"[Uncertain Suggestions] 异常: {e}")
+        # 使用默认建议
+        for i, item in enumerate(uncertain_items):
+            item['id'] = i + 1
+            item['suggestion'] = f"可以参考同类产品的{item['type']}设计"
+        return {
+            "has_uncertain": True,
+            "uncertain_items": uncertain_items,
+            "count": len(uncertain_items),
+            "error": str(e)
+        }

@@ -28,16 +28,23 @@ api.py - HTTP API 接口层
 │   ├── POST /ai_feedback      - 按需调用（should_feedback=true 时）
 │   ├── POST /qa_switch        - 问答处理
 │
+├── 用户反馈
+│   ├── POST /user_feedback    - 处理用户对AI建议的反馈（更新评分权重）
+│
 ├── 图像生成（自动读取 original_image，输出到 generated_images）
-│   ├── POST /generate_prompt  - 生成提示词（自动检测粗糙参考图）
-│   ├── POST /generate_image   - 调用 ComfyUI 生成图像
+│   ├── POST /generate_prompt     - 生成提示词（自动检测粗糙参考图）
+│   ├── POST /generate_image      - 调用 ComfyUI 生成图像
 │                          mode=1（部件）：自动读取 original_image/ 参考图
 │                          mode=2（整体）：自动读取 processed_images/ 部件图 + original_image/ 粗糙参考图
+│   ├── POST /generate_from_answer - 从AI回答生成图片（mico=1问答后调用，自动清空记录）
 │
 ├── 状态查询
 │   ├── GET  /memory_status    - 查询系统状态
 │   ├── GET  /components_list  - 获取部件列表
 │   ├── GET  /components_info  - 获取部件详情
+│   ├── POST /update_description - 修改部件描述内容
+│   ├── POST /memory_qa        - 单轮问答：问一句答一句
+│   ├── GET  /uncertain_suggestions - 获取不确定内容建议
 │
 ├── 语音管理
 │   ├── GET  /speech_text      - 获取累积语音文本
@@ -90,7 +97,7 @@ from main import (
 )
 
 # 导入 AI 反馈生成函数（供前端按需调用）
-from Feedback import generate_ai_feedback
+from Feedback import generate_ai_feedback, memory_qa_round, get_uncertain_suggestions, process_user_feedback
 
 # 导入提示词生成函数
 from generate import process_generate_request
@@ -100,11 +107,12 @@ from Generate_image import (
     generate_component_image,
     generate_overall_image,
     get_original_image,
-    get_processed_component_images
+    get_processed_component_images,
+    generate_image_from_ai_answer
 )
 
 # 导入记忆更新函数
-from Memory import batch_update_images
+from Memory import batch_update_images, update_description_content
 
 print("[api.py] 模块导入完成")
 
@@ -657,14 +665,67 @@ def api_generate_image():
         }), 500
 
 
+@app.route('/generate_from_answer', methods=['POST'])
+def api_generate_from_answer():
+    """
+    从最新 AI 回答自动生成图片（mico=1 问答后调用）
+
+    流程：
+    1. 用户在 mico=1 模式下提问 → AI 回答 → 系统自动记录
+    2. 用户调用此接口（不需要传入回答内容）
+    3. 系统自动获取最新 AI 回答
+    4. LLM 提取英文提示词
+    5. 调用 ComfyUI Text-to-Image 生成图片
+    6. 清空 AI 回答记录（下次问答会用新的）
+
+    输入:
+        {
+            "save_name": "ai_design"  // 可选：保存文件名
+        }
+
+    输出:
+        {
+            "success": true,
+            "ai_answer": "原始AI回答",
+            "prompt": "提取的英文提示词",
+            "image_paths": ["generated_images/ai_design_01.png"]
+        }
+
+    错误情况：
+        {
+            "success": false,
+            "error": "没有AI回答记录，请先在mico=1模式下提问"
+        }
+    """
+    try:
+        data = request.json or {}
+        save_name = data.get('save_name', 'ai_design')
+
+        # 调用生成函数（自动获取最新 AI 回答）
+        result = generate_image_from_ai_answer(save_name=save_name)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 @app.route('/qa_switch', methods=['POST'])
 def api_qa_switch():
     """
     问答处理（mico=1→0 切换时调用）
 
-    流程：获取累积语音 → 调用 LLM → 返回回答
+    流程：
+    - 传入 question：直接用问题调用 LLM（测试模式）
+    - 不传入 question：获取累积语音 → 调用 LLM（正常模式）
 
-    输入: 无
+    输入:
+        {
+            "question": "你觉得履带应该设计成什么风格？"  // 可选：测试时直接传入
+        }
 
     输出:
         {
@@ -674,6 +735,20 @@ def api_qa_switch():
         }
     """
     try:
+        data = request.json or {}
+        question = data.get('question', '')
+
+        # 如果传入问题，直接处理（测试模式）
+        if question:
+            from record import process_user_question
+            answer = process_user_question(question)
+            return jsonify({
+                "success": True,
+                "question": question,
+                "answer": answer
+            })
+
+        # 否则从累积语音获取（正常模式）
         result = handle_qa_switch()
         return jsonify(result)
 
@@ -736,6 +811,55 @@ def api_ai_feedback():
         return jsonify({
             "success": True,
             "feedback": feedback
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ==================== 用户反馈接口 ====================
+
+@app.route('/user_feedback', methods=['POST'])
+def api_user_feedback():
+    """
+    处理用户对 AI 建议的反馈
+
+    当用户对 AI 建议表达偏好时，分析反馈内容并更新评分权重，
+    使后续建议更贴合用户偏好。
+
+    输入:
+        {
+            "feedback": "我觉得可以更新颖一些"  // 必需：用户反馈文本
+        }
+
+    输出:
+        {
+            "success": true/false,
+            "dimension_changes": {"Novelty": +0.1, "Feasibility": -0.1},
+            "updated_weights": {"Novelty": 1.1, "Value": 1.0, "Feasibility": 0.9, "Context-specific": 1.0},
+            "analysis": "用户希望建议更创新，不太在意可行性"
+        }
+    """
+    try:
+        data = request.json or {}
+        feedback = data.get('feedback', '')
+
+        if not feedback:
+            return jsonify({
+                "success": False,
+                "error": "缺少 feedback 参数"
+            }), 400
+
+        result = process_user_feedback(feedback)
+
+        return jsonify({
+            "success": True,
+            "dimension_changes": result.get("dimension_changes", {}),
+            "updated_weights": result.get("updated_weights", {}),
+            "analysis": result.get("analysis", "")
         })
 
     except Exception as e:
@@ -810,6 +934,182 @@ def api_components_info():
         }
     """
     return jsonify(get_components_info())
+
+
+@app.route('/update_description', methods=['POST'])
+def api_update_description():
+    """
+    前端直接修改记忆中的描述内容
+
+    输入:
+        {
+            "target_name": "履带",           // 部件名称或 "整体"
+            "desc_type": "结构",              // 描述类型：结构/功能/不确定点/外形
+            "old_content": "齿轮连接结构",    // 原来的内容（用于定位）
+            "new_content": "螺纹连接结构"     // 修改后的内容
+        }
+
+    输出:
+        {
+            "success": true/false,
+            "message": "提示信息"
+        }
+    """
+    try:
+        data = request.get_json()
+
+        target_name = data.get('target_name')
+        desc_type = data.get('desc_type')
+        old_content = data.get('old_content')
+        new_content = data.get('new_content')
+
+        if not target_name:
+            return jsonify({
+                "success": False,
+                "message": "缺少 target_name 参数（部件名称或'整体'）"
+            }), 400
+
+        if not desc_type:
+            return jsonify({
+                "success": False,
+                "message": "缺少 desc_type 参数（结构/功能/不确定点/外形）"
+            }), 400
+
+        if not old_content:
+            return jsonify({
+                "success": False,
+                "message": "缺少 old_content 参数（原来的内容）"
+            }), 400
+
+        if not new_content:
+            return jsonify({
+                "success": False,
+                "message": "缺少 new_content 参数（修改后的内容）"
+            }), 400
+
+        success, message = update_description_content(
+            memory_db=memory_db,
+            target_name=target_name,
+            desc_type=desc_type,
+            old_content=old_content,
+            new_content=new_content
+        )
+
+        # 如果成功，保存记忆
+        if success:
+            save_memory()
+
+        return jsonify({
+            "success": success,
+            "message": message
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+
+@app.route('/memory_qa', methods=['POST'])
+def api_memory_qa():
+    """
+    多轮问答：AI生成最多3个问题，逐个询问用户。
+
+    使用流程：
+    1. 第一次调用（不传参数）→ AI分析记忆并生成最多3个问题
+    2. 用户回答后（只传 answer）→ AI自动匹配当前问题并更新记忆，继续问下一个
+    3. 当所有问题都回答完后，AI会重新分析记忆，可能生成新的问题
+    4. 循环直到 has_questions=false
+
+    用户只需要输入回答内容！不需要输入部件名和描述类型！
+
+    输入:
+        {
+            "answer": "科技风格，金属材质"  // 可选，用户回答（纯文本）
+        }
+        如果不传参数，表示开始新一轮问答
+
+    输出:
+        {
+            "has_questions": true/false,
+            "questions": [
+                {
+                    "target": "履带",
+                    "desc_type": "外形",
+                    "issue_type": "缺失",
+                    "issue": "外形描述完全缺失",
+                    "question": "履带的外形风格您希望是什么？"
+                },
+                ...最多3个
+            ],
+            "current_index": 0,  // 当前正在问第几个问题（0开始）
+            "current_question": {...},  // 当前正在问的问题（方便前端显示）
+            "update_result": "已为履带添加外形描述" 或 null,
+            "remaining_count": 2  // 还剩多少问题没问
+        }
+
+        当 has_questions=false 时，表示没有需要询问的问题了
+    """
+    try:
+        data = request.get_json() or {}
+
+        # 用户只需要传入回答内容（字符串）
+        user_answer = data.get('answer') if data.get('answer') else None
+
+        result = memory_qa_round(memory_db, user_answer)
+
+        # 如果有更新（不是跳过、失败、没有待回答），保存记忆
+        update_result = result.get('update_result', '')
+        if update_result and '失败' not in update_result and '没有待回答' not in update_result and '跳过' not in update_result:
+            save_memory()
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            "has_questions": False,
+            "questions": [],
+            "current_index": 0,
+            "update_result": None,
+            "remaining_count": 0,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/uncertain_suggestions', methods=['GET'])
+def api_uncertain_suggestions():
+    """
+    提取所有 status=0 的不确定内容，为每个生成简短建议
+
+    输入: 无
+
+    输出:
+        {
+            "has_uncertain": true/false,
+            "uncertain_items": [
+                {
+                    "id": 1,
+                    "target": "履带",
+                    "type": "外形",
+                    "content": "还没想好外形风格",
+                    "suggestion": "可考虑科技风格，与整体功能定位匹配"
+                }
+            ],
+            "count": 3
+        }
+    """
+    try:
+        result = get_uncertain_suggestions(memory_db)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            "has_uncertain": False,
+            "uncertain_items": [],
+            "count": 0,
+            "error": str(e)
+        }), 500
 
 
 # ==================== 语音管理接口 ====================
@@ -968,6 +1268,9 @@ if __name__ == '__main__':
     print("  GET  /memory_status       - 查询系统状态")
     print("  GET  /components_list     - 获取部件列表")
     print("  GET  /components_info     - 获取部件详情")
+    print("  POST /update_description  - 修改部件描述内容")
+    print("  POST /memory_qa           - 单轮问答：问一句答一句")
+    print("  GET  /uncertain_suggestions - 获取不确定内容建议")
 
     print("\n【语音管理】")
     print("  GET  /speech_text         - 获取累积语音文本")

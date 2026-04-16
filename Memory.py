@@ -730,6 +730,200 @@ def batch_update_images(
     return memory_db
 
 
+# ========== 前端直接修改记忆接口 ==========
+
+def update_description_content(
+    memory_db: Dict[str, Any],
+    target_name: str,
+    desc_type: str,
+    old_content: str,
+    new_content: str
+) -> Tuple[bool, str]:
+    """
+    前端直接修改记忆中的描述内容。
+
+    Args:
+        memory_db: 记忆数据库
+        target_name: 部件名称或 "整体"
+        desc_type: 描述类型，可选值："结构"、"功能"、"不确定点"
+        old_content: 原来的内容（用于定位要修改的条目）
+        new_content: 修改后的内容
+
+    Returns:
+        Tuple[bool, str]: (是否成功, 提示信息)
+    """
+    print(f"\n--- Update Description: '{target_name}' '{desc_type}' ---")
+    print(f"  Old: '{old_content}'")
+    print(f"  New: '{new_content}'")
+
+    # 映射描述类型到字段名
+    type_mapping = {
+        "结构": "structure_descriptions",
+        "功能": "function_descriptions",
+        "不确定点": "uncertain_descriptions",  # 这个是外观不确定的描述
+        "外形": "appearance_descriptions"
+    }
+
+    if desc_type not in type_mapping:
+        return False, f"不支持的描述类型：'{desc_type}'，可选值：结构、功能、不确定点、外形"
+
+    field_name = type_mapping[desc_type]
+
+    # 处理整体节点
+    if target_name.lower() == "整体":
+        overall_field_mapping = {
+            "结构": "overall_structures",
+            "功能": "overall_functions",
+            "不确定点": "overall_appearances",  # 整体的不确定点
+            "外形": "overall_appearances"
+        }
+        overall_field_name = overall_field_mapping.get(desc_type)
+
+        if not overall_field_name:
+            return False, f"整体不支持描述类型：'{desc_type}'"
+
+        for node_id, data in memory_db.items():
+            if data.get('node_type') == 'OVERALL':
+                descriptions = data.get(overall_field_name, [])
+
+                # 找到匹配的描述并更新
+                found = False
+                for i, desc in enumerate(descriptions):
+                    if desc.get('content', '') == old_content:
+                        descriptions[i]['content'] = new_content
+                        found = True
+                        break
+
+                if found:
+                    data[overall_field_name] = descriptions
+                    data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                    print(f"[Success] Updated overall '{desc_type}' description")
+                    return True, f"整体 '{desc_type}' 已从 '{old_content}' 更新为 '{new_content}'"
+                else:
+                    return False, f"整体中未找到 '{desc_type}' 内容：'{old_content}'"
+
+        return False, "未找到整体节点"
+
+    # 处理部件节点
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            existing_name = data.get('component_name', '')
+
+            # 名字匹配（忽略大小写）
+            if existing_name.lower() == target_name.lower():
+                descriptions = data.get(field_name, [])
+
+                # 找到匹配的描述并更新
+                found = False
+                for i, desc in enumerate(descriptions):
+                    if desc.get('content', '') == old_content:
+                        descriptions[i]['content'] = new_content
+                        found = True
+                        break
+
+                if found:
+                    data[field_name] = descriptions
+                    data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                    print(f"[Success] Updated '{existing_name}' '{desc_type}' description")
+                    return True, f"'{existing_name}' 的 '{desc_type}' 已从 '{old_content}' 更新为 '{new_content}'"
+                else:
+                    return False, f"'{existing_name}' 中未找到 '{desc_type}' 内容：'{old_content}'"
+
+    return False, f"未找到部件：'{target_name}'"
+
+
+def add_description_from_answer(
+    memory_db: Dict[str, Any],
+    target_name: str,
+    desc_type: str,
+    answer: str
+) -> Tuple[bool, str]:
+    """
+    用户回答问题后，添加新描述到记忆中。
+
+    Args:
+        memory_db: 记忆数据库
+        target_name: 部件名称或 "整体"
+        desc_type: 描述类型，可选值："外形"、"功能"、"结构"
+        answer: 用户回答的内容
+
+    Returns:
+        Tuple[bool, str]: (是否成功, 提示信息)
+    """
+    print(f"\n--- Add Description from Answer: '{target_name}' '{desc_type}' ---")
+    print(f"  Answer: '{answer}'")
+
+    if not answer or not answer.strip():
+        return False, "回答内容不能为空"
+
+    # 映射描述类型到字段名
+    type_mapping = {
+        "外形": "appearance_descriptions",
+        "功能": "function_descriptions",
+        "结构": "structure_descriptions"
+    }
+
+    if desc_type not in type_mapping:
+        return False, f"不支持的描述类型：'{desc_type}'，可选值：外形、功能、结构"
+
+    field_name = type_mapping[desc_type]
+
+    # 创建新描述（status=1，已确定）
+    new_desc = {
+        "content": answer.strip(),
+        "status": 1
+    }
+
+    # 处理整体节点
+    if target_name.lower() == "整体":
+        overall_field_mapping = {
+            "外形": "overall_appearances",
+            "功能": "overall_functions",
+            "结构": "overall_structures"
+        }
+        overall_field_name = overall_field_mapping.get(desc_type)
+
+        if not overall_field_name:
+            return False, f"整体不支持描述类型：'{desc_type}'"
+
+        for node_id, data in memory_db.items():
+            if data.get('node_type') == 'OVERALL':
+                descriptions = data.get(overall_field_name, [])
+                descriptions.append(new_desc)
+                data[overall_field_name] = descriptions
+                data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                print(f"[Success] Added overall '{desc_type}' description")
+                return True, f"已为整体添加 '{desc_type}' 描述：'{answer}'"
+
+        # 没找到整体节点，创建新的
+        new_overall = OverallNode()
+        setattr(new_overall, overall_field_name, [new_desc])
+        memory_db[new_overall.node_id] = new_overall.model_dump()
+        print(f"[Success] Created overall with '{desc_type}' description")
+        return True, f"已创建整体节点并添加 '{desc_type}' 描述：'{answer}'"
+
+    # 处理部件节点
+    for node_id, data in memory_db.items():
+        if data.get('node_type') == 'COMPONENT':
+            existing_name = data.get('component_name', '')
+
+            # 名字匹配（忽略大小写）
+            if existing_name.lower() == target_name.lower():
+                descriptions = data.get(field_name, [])
+                descriptions.append(new_desc)
+                data[field_name] = descriptions
+                data['timestamp_last_accessed'] = datetime.now(timezone.utc).isoformat()
+                print(f"[Success] Added '{existing_name}' '{desc_type}' description")
+                return True, f"已为 '{existing_name}' 添加 '{desc_type}' 描述：'{answer}'"
+
+    # 没找到部件，创建新的
+    new_component = ComponentNode(component_name=target_name)
+    setattr(new_component, field_name, [new_desc])
+    memory_db[new_component.node_id] = new_component.model_dump()
+    print(f"[Success] Created '{target_name}' with '{desc_type}' description")
+    return True, f"已创建 '{target_name}' 部件并添加 '{desc_type}' 描述：'{answer}'"
+
+
 # ========== 主程序 ==========
 
 if __name__ == "__main__":

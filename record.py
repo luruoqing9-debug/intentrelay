@@ -463,9 +463,29 @@ def handle_mode_switch_to_mico0(
     return process_user_question(transcript_text)
 
 
+# ========== 最新 AI 回答记录 ==========
+# 用于 mico=1 问答后自动生成图片
+
+_latest_ai_answer = ""
+
+
+def get_latest_ai_answer() -> str:
+    """获取最新一次 AI 回答（用于生成图片）"""
+    return _latest_ai_answer
+
+
+def clear_latest_ai_answer():
+    """清空最新 AI 回答记录"""
+    global _latest_ai_answer
+    _latest_ai_answer = ""
+    print("[AI Answer] Cleared latest answer record")
+
+
 def process_user_question(question: str) -> str:
     """
     处理用户提问（mico=1时调用），让LLM生成回答。
+
+    同时记录最新回答，供后续生成图片使用。
 
     Args:
         question: 用户的问题文本
@@ -473,6 +493,8 @@ def process_user_question(question: str) -> str:
     Returns:
         LLM的回答内容
     """
+    global _latest_ai_answer
+
     prompt = f'''
 你是一个专业的设计助手，正在协助用户进行产品设计。请回答用户的问题，给出简洁、专业的建议。
 
@@ -487,7 +509,12 @@ def process_user_question(question: str) -> str:
     )
 
     answer = response.text
+
+    # 记录最新 AI 回答（供后续生成图片使用）
+    _latest_ai_answer = answer
     print(f"[LLM Answer] {answer}")
+    print("[AI Answer] Recorded for image generation")
+
     return answer
 
 

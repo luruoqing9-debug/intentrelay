@@ -271,6 +271,7 @@ COMFY_API_KEY = "comfyui-54ae45038ffb9ec10eb61cf40f84c436623b70e64a5cbcd9bb4cc86
 # 工作流模板路径
 COMPONENT_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/Component_generation.json"  # 部件生成
 OVERALL_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/google_Gemini_image.json"     # 整体生成
+TEXT_TO_IMAGE_WORKFLOW_PATH = "D:/ComfyUI/user/default/workflows/Text-to-Image.json"     # 纯文本生成
 
 
 # ========== ComfyUI API 客户端 ==========
@@ -445,13 +446,63 @@ class ComfyUIClient:
         # 确保目录存在
         os.makedirs(output_dir, exist_ok=True)
 
+        # 等待一下确保历史记录已写入
+        time.sleep(0.5)
+
         history = self.get_history(prompt_id)
+        print(f"[ComfyUI] Full history response keys: {list(history.keys())}")
+
         prompt_history = history.get(prompt_id, {})
+        print(f"[ComfyUI] Prompt history keys: {list(prompt_history.keys())}")
+
         outputs = prompt_history.get('outputs', {})
+        print(f"[ComfyUI] Outputs dict: {outputs}")
+
+        # 如果 outputs 为空，检查 status 和其他字段
+        if not outputs:
+            status = prompt_history.get('status', {})
+            print(f"[ComfyUI] Status: {status}")
+            print(f"[ComfyUI] Prompt history content: {prompt_history}")
+
+            # 尝试直接从 ComfyUI output 目录复制
+            comfyui_output_dir = "D:/ComfyUI/output"
+            if os.path.exists(comfyui_output_dir):
+                # 找到最新的图片文件（按 prompt_id 过滤或取最新的）
+                all_images = [f for f in os.listdir(comfyui_output_dir)
+                              if f.endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+                print(f"[ComfyUI] Found {len(all_images)} images in output folder")
+
+                if all_images:
+                    # 按修改时间排序，取最新的
+                    latest_images = sorted(
+                        all_images,
+                        key=lambda x: os.path.getmtime(os.path.join(comfyui_output_dir, x)),
+                        reverse=True
+                    )[:3]  # 取最新的3张
+
+                    saved_paths = []
+                    for idx, img_name in enumerate(latest_images):
+                        src_path = os.path.join(comfyui_output_dir, img_name)
+                        if save_name:
+                            final_name = f"{save_name}_{idx}.png"
+                        else:
+                            final_name = f"generated_{img_name}"
+                        dst_path = os.path.join(output_dir, final_name)
+                        shutil.copy(src_path, dst_path)
+                        saved_paths.append(dst_path)
+                        print(f"[ComfyUI] Copied from output folder: {dst_path}")
+
+                    return saved_paths
+
+            return []
 
         saved_paths = []
 
         for node_id, node_output in outputs.items():
+            # 打印每个节点的输出
+            print(f"[ComfyUI] Node {node_id} output keys: {list(node_output.keys())}")
+
+            # 处理图片（文件形式）
             if 'images' in node_output:
                 for idx, image_info in enumerate(node_output['images']):
                     filename = image_info.get('filename')
@@ -470,15 +521,13 @@ class ComfyUIClient:
 
                     response = requests.get(url, params=params)
                     if response.status_code == 200:
-                        # 确定保存的文件名
+                        # 定保存的文件名
                         if save_name:
-                            # 如果指定了保存名称，使用该名称（多张图片时加序号）
                             if len(node_output['images']) > 1:
                                 final_name = f"{save_name}_{idx}{ext}"
                             else:
                                 final_name = f"{save_name}{ext}"
                         else:
-                            # 否则使用原文件名加前缀
                             final_name = f"generated_{filename}"
 
                         local_path = os.path.join(output_dir, final_name)
@@ -486,6 +535,32 @@ class ComfyUIClient:
                             f.write(response.content)
                         saved_paths.append(local_path)
                         print(f"[ComfyUI] Saved image: {local_path}")
+
+            # 处理 base64 图片数据（OpenAI GPT Image 可能返回这种格式）
+            if 'b64_json' in node_output or 'images_b64' in node_output:
+                b64_key = 'b64_json' if 'b64_json' in node_output else 'images_b64'
+                b64_images = node_output[b64_key]
+                if isinstance(b64_images, str):
+                    b64_images = [b64_images]
+
+                for idx, b64_data in enumerate(b64_images):
+                    # 解码 base64
+                    image_data = base64.b64decode(b64_data)
+
+                    # 确定保存的文件名
+                    if save_name:
+                        if len(b64_images) > 1:
+                            final_name = f"{save_name}_{idx}.png"
+                        else:
+                            final_name = f"{save_name}.png"
+                    else:
+                        final_name = f"generated_{node_id}_{idx}.png"
+
+                    local_path = os.path.join(output_dir, final_name)
+                    with open(local_path, 'wb') as f:
+                        f.write(image_data)
+                    saved_paths.append(local_path)
+                    print(f"[ComfyUI] Saved base64 image: {local_path}")
 
         return saved_paths
 
@@ -574,15 +649,19 @@ def convert_ui_to_api_workflow(ui_workflow: dict) -> dict:
         widget_idx = 0
         for input_def in input_defs:
             input_name = input_def.get('name')
-            if input_name not in ['upload']:  # 跳过特殊输入
+            # 跳过特殊输入和可选的连接输入（shape=7表示可选）
+            if input_name not in ['upload']:
                 # 检查是否有连接
                 link_id = input_def.get('link')
                 if link_id is not None and link_id in links_map:
                     # 有连接，使用连接的输出
                     from_node, from_slot, _, _ = links_map[link_id]
                     inputs[input_name] = [str(from_node), from_slot]
+                elif input_def.get('shape') == 7:
+                    # 可选输入（shape=7），无连接时跳过，不使用 widgets_values
+                    pass
                 elif widget_idx < len(widgets_values):
-                    # 无连接，使用 widgets_values
+                    # 有 widget 的输入，使用 widgets_values
                     inputs[input_name] = widgets_values[widget_idx]
                     widget_idx += 1
 
@@ -597,6 +676,20 @@ def convert_ui_to_api_workflow(ui_workflow: dict) -> dict:
                 inputs['aspect_ratio'] = widgets_values[4]
                 inputs['response_modalities'] = widgets_values[5]
                 inputs['system_prompt'] = widgets_values[6]
+
+        # 特殊处理：OpenAIGPTImage1 (OpenAI GPT Image 生成节点)
+        # widgets_values 格式: [prompt, seed, randomize, quality, background, size, n, model]
+        # 但 input_defs 有可选的 image 和 mask，导致顺序错位
+        if 'OpenAIGPTImage' in class_type:
+            if len(widgets_values) >= 8:
+                inputs['prompt'] = widgets_values[0]
+                inputs['seed'] = widgets_values[1]
+                inputs['quality'] = widgets_values[3]      # low/medium/high
+                inputs['background'] = widgets_values[4]   # opaque/transparent
+                inputs['size'] = widgets_values[5]         # auto/1024x1024/...
+                inputs['n'] = widgets_values[6]            # 图片数量 (INT)
+                inputs['model'] = widgets_values[7]        # gpt-image-1/gpt-image-1.5
+                print(f"[Workflow] OpenAIGPTImage node converted: prompt={widgets_values[0][:50]}...")
 
         # 特殊处理：LoadImage
         if class_type == 'LoadImage':
@@ -1023,6 +1116,194 @@ def generate_image_from_folder(
         save_name=save_name,
         timeout=timeout
     )
+
+
+# ========== 从 AI 回答生成图片 ==========
+
+# Feedback_image 文件夹路径（AI问答后生成的图片）
+FEEDBACK_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "Feedback_image")
+
+
+def generate_image_from_ai_answer(
+    workflow_path: str = TEXT_TO_IMAGE_WORKFLOW_PATH,
+    seed: int = None,
+    output_dir: str = None,
+    save_name: str = "ai_design",
+    timeout: int = 300
+) -> dict:
+    """
+    从最新 AI 回答自动提取提示词并生成图片
+
+    流程：
+    1. 用户在 mico=1 模式下提问 → AI 回答 → 系统自动记录
+    2. 用户调用此函数（不需要传入回答内容）
+    3. 系统自动获取最新 AI 回答
+    4. LLM 从回答中提取英文提示词
+    5. 调用 ComfyUI Text-to-Image workflow 生成图片
+    6. 自动清空 AI 回答记录
+
+    注意：
+    - 图片保存到 Feedback_image 文件夹
+    - 调用此函数会自动清空 AI 回答记录
+    - 如果没有 AI 回答记录，会返回错误
+
+    Args:
+        workflow_path: 工作流模板路径（默认 Text-to-Image.json）
+        seed: 种子值
+        output_dir: 输出目录（默认为 Feedback_image 文件夹）
+        save_name: 保存的文件名（默认为 "ai_design"）
+        timeout: 超时时间（秒）
+
+    Returns:
+        dict: {
+            "success": True/False,
+            "ai_answer": "原始AI回答",
+            "prompt": "提取的英文提示词",
+            "image_paths": ["生成的图片路径列表"],
+            "error": "错误信息（如果失败）"
+        }
+    """
+    from record import client, extract_and_parse_json, get_latest_ai_answer, clear_latest_ai_answer
+
+    # 默认输出目录为 Feedback_image
+    if output_dir is None:
+        output_dir = FEEDBACK_IMAGE_DIR
+        os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n=== 从 AI 回答生成图片 ===")
+    print(f"[Output] Directory: {output_dir}")
+
+    # 1. 获取最新 AI 回答
+    ai_answer = get_latest_ai_answer()
+
+    if not ai_answer:
+        print("[Error] No AI answer recorded")
+        return {
+            "success": False,
+            "error": "没有AI回答记录，请先在mico=1模式下提问"
+        }
+
+    print(f"[AI Answer] {ai_answer[:100]}...")
+
+    # 2. 从 AI 回答中提取提示词
+    extract_prompt = f'''
+你是一个设计助手。用户提出了设计问题，AI 给出了回答。
+请从 AI 回答中提取适合图像生成的设计描述/提示词。
+
+## AI 回答内容
+{ai_answer}
+
+## 任务
+1. 分析 AI 回答中的关键设计元素（外形、材质、颜色、风格、结构等）
+2. 将这些元素整合成一段适合图像生成的英文提示词（简洁、具体、不超过100字）
+3. 提示词应该简洁、具体、易于理解
+
+## 输出格式（JSON）
+{{
+    "prompt": "英文提示词，描述设计内容",
+    "design_elements": ["列出提取的关键设计元素"]
+}}
+
+请输出 JSON 格式。
+'''
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[extract_prompt]
+        )
+        result = extract_and_parse_json(response.text)
+
+        if result is None or "prompt" not in result:
+            print("[Warning] Failed to extract prompt, using AI answer directly")
+            prompt = translate_to_english(ai_answer)
+            design_elements = []
+        else:
+            prompt = result.get("prompt", ai_answer)
+            design_elements = result.get("design_elements", [])
+            print(f"[Extracted] Design elements: {design_elements}")
+            print(f"[Extracted] Prompt: {prompt}")
+
+    except Exception as e:
+        print(f"[Error] Extract prompt failed: {e}")
+        prompt = translate_to_english(ai_answer)
+        design_elements = []
+
+    if not prompt:
+        print("[Error] No prompt available")
+        clear_latest_ai_answer()  # 清空记录
+        return {
+            "success": False,
+            "error": "无法提取提示词"
+        }
+
+    # 3. 加载 Text-to-Image workflow
+    try:
+        workflow = load_workflow_template(workflow_path)
+    except Exception as e:
+        print(f"[Error] Failed to load workflow: {e}")
+        clear_latest_ai_answer()
+        return {
+            "success": False,
+            "error": f"工作流加载失败: {str(e)}"
+        }
+
+    # 4. 修改 workflow 中的参数
+    # OpenAIGPTImage1 的 widgets_values 格式：
+    # [prompt, seed, randomize, quality, background, size, n, model]
+    # 只修改 prompt，其他参数全部保持工作流默认值
+    for node in workflow.get('nodes', []):
+        node_type = node.get('type', '')
+        node_id = node.get('id')
+
+        # OpenAIGPTImage1 节点（OpenAI GPT Image 生成）
+        if 'OpenAIGPTImage' in node_type:
+            widgets_values = node.get('widgets_values', [])
+
+            # 打印原始值（调试）
+            print(f"[Workflow] Node {node_id} original widgets: {widgets_values}")
+
+            # 只修改 prompt（位置0），其他参数全部保持默认值
+            if len(widgets_values) >= 1:
+                widgets_values[0] = prompt  # prompt
+                node['widgets_values'] = widgets_values
+                print(f"[Workflow] Updated prompt: {prompt[:50]}...")
+
+    # 5. 提交到 ComfyUI
+    try:
+        comfyui_client = ComfyUIClient()
+        prompt_id = comfyui_client.queue_prompt(workflow)
+
+        # 6. 等待完成
+        comfyui_client.wait_for_completion(prompt_id, timeout=timeout)
+
+        # 7. 获取生成的图片
+        saved_paths = comfyui_client.get_output_images(
+            prompt_id=prompt_id,
+            output_dir=output_dir,  # 使用 Feedback_image 目录
+            save_name=save_name
+        )
+
+        print(f"[Result] Generated images: {saved_paths}")
+
+        # 8. 清空 AI 回答记录（下一次问答会用新的）
+        clear_latest_ai_answer()
+
+        return {
+            "success": True,
+            "ai_answer": ai_answer,
+            "prompt": prompt,
+            "design_elements": design_elements,
+            "image_paths": saved_paths
+        }
+
+    except Exception as e:
+        print(f"[Error] ComfyUI execution failed: {e}")
+        clear_latest_ai_answer()
+        return {
+            "success": False,
+            "error": f"图片生成失败: {str(e)}"
+        }
 
 
 # ========== 提示词生成 + 图片生成统一接口 ==========
