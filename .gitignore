@@ -35,3 +35,6 @@ test.png
 *.jpeg
 *.bmp
 *.gif
+
+# 模型文件（太大不提交）
+*.pt

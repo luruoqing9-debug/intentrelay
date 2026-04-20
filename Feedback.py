@@ -661,7 +661,7 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
                 },
                 ...最多3个
             ],
-            "current_index": 0,  // 当前正在问第几个问题
+            "current_index": 0,  // 当前正在问第几个问题（前端可用 questions[current_index] 获取当前问题）
             "update_result": "已更新" 或 null,
             "remaining_count": 2  // 剩余多少问题没问
         }
@@ -721,7 +721,6 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
             "has_questions": True,
             "questions": _question_list,
             "current_index": _current_question_index,
-            "current_question": current_question,
             "update_result": update_result,
             "remaining_count": remaining_count
         }
@@ -737,7 +736,6 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
             "has_questions": False,
             "questions": [],
             "current_index": 0,
-            "current_question": None,
             "update_result": update_result,
             "remaining_count": 0
         }
@@ -906,16 +904,14 @@ def memory_qa_round(memory_db: dict, user_answer: str = None) -> dict:
     # 3. 如果还有未问完的问题，返回当前问题
     else:
         remaining_count = len(_question_list) - _current_question_index
-        current_question = _question_list[_current_question_index] if _current_question_index < len(_question_list) else None
 
-        print(f"[Memory QA] 当前问题[{_current_question_index}]: {current_question}")
+        print(f"[Memory QA] 当前问题[{_current_question_index}]")
         print(f"[Memory QA] 剩余 {remaining_count} 个问题")
 
         return {
             "has_questions": remaining_count > 0,
             "questions": _question_list,
             "current_index": _current_question_index,
-            "current_question": current_question,  # 当前正在问的问题
             "update_result": update_result,
             "remaining_count": remaining_count
         }

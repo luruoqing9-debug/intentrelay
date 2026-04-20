@@ -58,14 +58,24 @@ api.py - HTTP API 接口层
 import os
 import sys
 import json
+import threading
+import time
+import base64
 
 # 禁用警告
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, render_template_string, send_file
 from flask_cors import CORS
+
+# YOLO 相关导入
+import cv2
+import numpy as np
+from copy import deepcopy
+from ultralytics import YOLO
+from viewpoint import get_resolution_and_viewpoint_base64
 
 print("[api.py] 正在导入模块...")
 
@@ -122,10 +132,254 @@ print("[api.py] 模块导入完成")
 app = Flask(__name__)
 CORS(app)
 
+# ==================== 静态文件服务（图片URL）====================
+
+# 项目目录
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+ORIGINAL_IMAGE_DIR = os.path.join(PROJECT_DIR, "original_image")
+PROCESSED_IMAGE_DIR = os.path.join(PROJECT_DIR, "processed_images")
+GENERATED_IMAGE_DIR = os.path.join(PROJECT_DIR, "generated_images")
+FEEDBACK_IMAGE_DIR = os.path.join(PROJECT_DIR, "Feedback_image")
+
+# 确保文件夹存在
+os.makedirs(ORIGINAL_IMAGE_DIR, exist_ok=True)
+os.makedirs(PROCESSED_IMAGE_DIR, exist_ok=True)
+os.makedirs(GENERATED_IMAGE_DIR, exist_ok=True)
+os.makedirs(FEEDBACK_IMAGE_DIR, exist_ok=True)
+
+
+def path_to_url(local_path: str) -> str:
+    """
+    将本地路径转换为 HTTP URL
+
+    Args:
+        local_path: 本地路径，支持多种格式：
+                    - Windows绝对路径：D:\...\original_image\xxx.png
+                    - 相对路径：original_image/xxx.png 或 original_image\xxx.png
+
+    Returns:
+        URL，如 "http://localhost:5000/images/original/xxx.png"
+    """
+    if not local_path:
+        return ""
+
+    # 统一使用正斜杠处理
+    normalized_path = local_path.replace("\\", "/")
+
+    # 提取文件夹名和文件名
+    parts = normalized_path.split("/")
+
+    # 找到文件夹名（original_image、processed_images、generated_images、Feedback_image）
+    folder = None
+    filename = None
+
+    for i, part in enumerate(parts):
+        if part in ["original_image", "processed_images", "generated_images", "Feedback_image"]:
+            folder = part
+            # 文件名是后面的部分
+            filename = parts[i + 1] if i + 1 < len(parts) else None
+            break
+
+    if folder and filename:
+        # 统一 Feedback_image 到 generated_images 路由
+        if folder == "Feedback_image":
+            return f"http://localhost:5000/images/generated/{filename}"
+        elif folder == "original_image":
+            return f"http://localhost:5000/images/original/{filename}"
+        elif folder == "processed_images":
+            return f"http://localhost:5000/images/processed/{filename}"
+        elif folder == "generated_images":
+            return f"http://localhost:5000/images/generated/{filename}"
+
+    return local_path
+
+
+@app.route('/images/original/<filename>')
+def serve_original_image(filename):
+    """提供 original_image 文件夹的图片"""
+    filepath = os.path.join(ORIGINAL_IMAGE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return jsonify({"error": "文件不存在"}), 404
+
+
+@app.route('/images/processed/<filename>')
+def serve_processed_image(filename):
+    """提供 processed_images 文件夹的图片"""
+    filepath = os.path.join(PROCESSED_IMAGE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return jsonify({"error": "文件不存在"}), 404
+
+
+@app.route('/images/generated/<filename>')
+def serve_generated_image(filename):
+    """提供 generated_images 和 Feedback_image 文件夹的图片"""
+    # 先检查 generated_images
+    filepath = os.path.join(GENERATED_IMAGE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+
+    # 再检查 Feedback_image
+    filepath = os.path.join(FEEDBACK_IMAGE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+
+    return jsonify({"error": "文件不存在"}), 404
+
+
+# ==================== YOLO 模型初始化 ====================
+
+print("[api.py] 正在加载 YOLO 模型...")
+yolo_model = YOLO('yolov8x-seg.pt')
+print("[api.py] YOLO 模型加载完毕")
+
+# YOLO 配置
+IS_SHOW_BBOX = False  # 默认隐藏 bbox，可改为 True 显示
+OUTPUT_VIDEO_FPS = 10
+
+# YOLO 全局状态
+latest_processed_frame = None
+yolo_lock = threading.Lock()
+
 
 # ==================== 全局状态 ====================
 
 _system_initialized = False
+
+
+# ==================== YOLO 处理接口 ====================
+
+@app.route('/yolo_process', methods=['POST'])
+def yolo_process():
+    """
+    YOLO 目标检测处理
+
+    输入:
+        {
+            "frame": "base64编码的图像",
+            "count": 帧序号
+        }
+
+    输出:
+        {
+            "frame": "处理后的图像base64",
+            "count": 帧序号,
+            "detection": [{"name": "物体名", "box": [x1,y1,x2,y2]}],
+            "view_point": [x, y] 或 null
+        }
+    """
+    global latest_processed_frame
+
+    data = request.get_json()
+    img_base64 = data.get("frame")
+    count = data.get("count")
+    detection_info = []
+
+    if img_base64:
+        frame_bytes = base64.b64decode(img_base64)
+        frame_np = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+        # YOLO 推理
+        results = yolo_model(frame_np, conf=0.4, iou=0.5, imgsz=(frame_np.shape[0], frame_np.shape[1]))
+
+        boxes = results[0].boxes
+        if boxes is not None and boxes.xyxy is not None and boxes.cls is not None:
+            for box, cls in zip(boxes.xyxy.cpu().numpy(), boxes.cls.cpu().numpy()):
+                name = yolo_model.names[int(cls)]
+                x1, y1, x2, y2 = box
+                detection_info.append({
+                    'name': name,
+                    'box': [float(x1), float(y1), float(x2), float(y2)]
+                })
+
+        # 生成处理后的帧
+        if IS_SHOW_BBOX:
+            processed_frame = results[0].plot(img=frame_np.copy())
+        else:
+            processed_frame = deepcopy(frame_np)
+
+        with yolo_lock:
+            latest_processed_frame = processed_frame
+
+        # 获取视点
+        res, vp = get_resolution_and_viewpoint_base64(img_base64)
+        view_point = [vp[0], vp[1]] if vp else None
+
+        return jsonify({
+            "frame": img_base64,
+            "count": count,
+            "detection": detection_info,
+            "view_point": view_point
+        })
+
+    return jsonify({"error": "no frame"}), 400
+
+
+# 实时预览 HTML 模板
+YOLO_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO分割实时画面</title>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; display: flex; justify-content: center; align-items: center; }
+        img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    </style>
+</head>
+<body>
+    <img src="{{ url_for('yolo_feed') }}" ondblclick="toggleFullScreen(this)">
+    <script>
+        function toggleFullScreen(elem) {
+            if (!document.fullscreenElement) {
+                if (elem.requestFullscreen) elem.requestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/show_yolo')
+def show_yolo():
+    """YOLO 实时预览页面"""
+    return render_template_string(YOLO_HTML_TEMPLATE)
+
+
+def generate_yolo_preview():
+    """生成 YOLO 实时预览流"""
+    last_frame_sent = None
+    while True:
+        frame_to_send = None
+        with yolo_lock:
+            if latest_processed_frame is not None:
+                frame_to_send = latest_processed_frame.copy()
+                last_frame_sent = frame_to_send
+
+        if frame_to_send is None and last_frame_sent is not None:
+            frame_to_send = last_frame_sent
+
+        if frame_to_send is not None:
+            flag, encodedImage = cv2.imencode(".jpg", frame_to_send)
+            if not flag:
+                time.sleep(0.01)
+                continue
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' +
+                   bytearray(encodedImage) + b'\r\n')
+            time.sleep(1/OUTPUT_VIDEO_FPS)
+        else:
+            time.sleep(0.1)
+
+
+@app.route('/yolo_feed')
+def yolo_feed():
+    """YOLO 实时视频流"""
+    return Response(generate_yolo_preview(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 # ==================== 系统控制接口 ====================
@@ -409,11 +663,11 @@ def api_generate_prompt():
             # 自动获取部件图片（排除 overall.png）
             component_image_paths = get_processed_component_images(exclude_overall=True)
             component_count = len(component_image_paths)
-            component_images = [os.path.basename(p) for p in component_image_paths]
+            component_images = [path_to_url(p) for p in component_image_paths]
 
             print(f"[generate_prompt] 检测到 {component_count} 个部件图片")
-            for name in component_images:
-                print(f"  - {name}")
+            for url in component_images:
+                print(f"  - {url}")
 
             # 自动生成 component_image_mapping（文件名 -> 索引）
             if not component_image_mapping:
@@ -580,12 +834,12 @@ def api_generate_image():
             for path in saved_paths:
                 filename = os.path.basename(path)
                 final_path = os.path.join(processed_images_dir, filename)
-                final_paths.append(final_path)
+                final_paths.append(path_to_url(final_path))
 
             return jsonify({
                 "success": True,
                 "image_paths": final_paths,
-                "reference_image_used": reference_image
+                "reference_image_used": path_to_url(reference_image)
             })
 
         elif mode == 2:
@@ -637,17 +891,20 @@ def api_generate_image():
             for path in saved_paths:
                 filename = os.path.basename(path)
                 final_path = os.path.join(processed_images_dir, filename)
-                final_paths.append(final_path)
+                final_paths.append(path_to_url(final_path))
+
+            # 转换部件图路径为 URL
+            component_image_urls = [path_to_url(p) for p in component_image_paths]
 
             result = {
                 "success": True,
                 "image_paths": final_paths,
                 "component_count": len(component_image_paths),
-                "component_images_used": component_image_paths  # 返回使用的部件图路径
+                "component_images_used": component_image_urls  # 返回使用的部件图 URL
             }
 
             if reference_image:
-                result["reference_image_used"] = reference_image
+                result["reference_image_used"] = path_to_url(reference_image)
                 result["overall_image_index"] = len(component_image_paths)  # 粗糙参考图的索引
 
             return jsonify(result)
@@ -703,6 +960,10 @@ def api_generate_from_answer():
 
         # 调用生成函数（自动获取最新 AI 回答）
         result = generate_image_from_ai_answer(save_name=save_name)
+
+        # 转换图片路径为 URL
+        if result.get("success") and result.get("image_paths"):
+            result["image_paths"] = [path_to_url(p) for p in result["image_paths"]]
 
         return jsonify(result)
 
